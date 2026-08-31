@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "releases": [
+    {
+      "version": "1.10",
+      "date": "2026-05-15",
+      "headline": "Smarter solver efficiency and card type controls.",
+      "summary": "Improved solver efficiency and added clearer control over which card types the solver can use.",
+      "details": [
+        "Added solved squad player pricing.",
+        "Improved solver efficiency so it should use less high rated player anchors.",
+        "Added card type pickers to the single, multi, and sequence solvers."
+      ]
+    },
+    {
+      "version": "1.9.3",
+      "date": "2026-05-08",
+      "headline": "Improved sequence solver panel and solving algorithm.",
+      "summary": "Added a review before submit mode as an option in the sequence solver.",
+      "details": [
+        "Added a review before submit mode as an option in the sequence solver.",
+        "improved sequence solvers algorthim to deal with complex chem challenges."
+      ]
+    },
+    {
+      "version": "1.9.2",
+      "date": "2026-04-25",
+      "headline": "Improved fetching speeds.",
+      "summary": "Made player fetching much more efficient and take less time.",
+      "details": [
+        "Made player fetching much more efficient and take less time.",
+        "Minor imrpovement to solver logic to fix a small regression."
+      ]
+    },
+    {
+      "version": "1.9.1",
+      "date": "2026-04-19",
+      "headline": "TOTS solver fix",
+      "summary": "Improved solver logic to recognise TOTS requirements and club players.",
+      "details": [
+        "Improved solver logic to recognise TOTS requirements and club players.",
+        "Added a button to quickly view the extensions source code in the global settings menu."
+      ]
+    },
+    {
+      "version": "1.9",
+      "date": "2026-04-18",
+      "headline": "Solver and player pool fixes",
+      "summary": "Improved solver logic and fixed the SBC Storage and Use Unassigned settings.",
+      "details": [
+        "Improved solver logic so it handles SBCs more reliably.",
+        "Fixed Only Storage so it properly uses players that match your SBC storage.",
+        "Fixed Use Unassigned so unassigned players can be fetched, solved with, and applied correctly.",
+        "WE ARE OFFICIALLY OPEN SOURCE!!!  https://github.com/just-a-weird-guy/AutoPilot-SBC"
+      ]
+    },
+    {
+      "version": "1.8",
+      "date": "2026-04-01",
+      "headline": "More reliable solving and smarter fetching",
+      "summary": "Made the solver more reliable, improved player fetching, and cleaned up small UI details.",
+      "details": [
+        "Added a better fallback flow so the solver recovers more reliably solve difficult challenges.",
+        "Improved player fetching to allow for more intelligent triggers.",
+        "Made small UI improvements and cleanup tweaks."
+      ]
+    },
+    {
+      "version": "1.7.1",
+      "date": "2026-03-27",
+      "headline": "Fixes and patching",
+      "summary": "Cleaned up recent issues and patched smaller rough edges across the extension.",
+      "details": [
+        "Added a ratings slider to the sequence solver",
+        "Made small UI tweaks for consistency.",
+        "Fixed multi solver not syncing with global settings."
+      ]
+    },
+    {
+      "version": "1.7",
+      "date": "2026-03-22",
+      "headline": "Sequence Solver fixes",
+      "summary": "Improved Sequence Solver feedback, progress, and hub reliability.",
+      "details": [
+        "Made failure messages clearer.",
+        "Progress now updates during active solve phases.",
+        "Improved handling for refreshed or relisted SBC challenges.",
+        "Fixed the missing Sequence Solver button bug in the SBC tab."
+      ]
+    },
+    {
+      "version": "1.6",
+      "date": "2026-03-20",
+      "headline": "Better sequence runs and easier solver control",
+      "summary": "Made Sequence Solver easier to follow and added more control over who the solver can use.",
+      "details": [
+        "Sequence Solver now shows the exact players used for each completed challenge.",
+        "Sequence Solver now lets you flip through completed challenge entries inside the execution panel.",
+        "Added local league and nation exclusions so you can block or allow them for a specific solve without changing your global settings.",
+        "TOTW cards can now be controlled separately from the main special-card filter.",
+        "Fixed exclusion panels so they show the right blocked items, stay in sync, and scroll properly."
+      ]
+    },
+    {
+      "version": "1.5",
+      "date": "2026-03-10",
+      "headline": "Sequence Solver is live",
+      "summary": "Plan and solve multiple SBCs in one run.",
+      "details": [
+        "Added the new Sequence Solver.",
+        "Save sequence plans and run them in order.",
+        "Added plan loops, step loops, and execution progress."
+      ]
+    },
+    {
+      "version": "1.4",
+      "date": "2026-03-09",
+      "headline": "Changelog and update notes",
+      "summary": "Added a changelog popup for installs and updates.",
+      "details": [
+        "Added a changelog popup after installs and updates.",
+        "Added a Changelog button in Settings.",
+        "Saved viewed status so it only opens once per version."
+      ]
+    },
+    {
+      "version": "1.3",
+      "date": "2026-03-05",
+      "headline": "Speed and solver improvements",
+      "summary": "Improved player lookup and squad applying speed.",
+      "details": [
+        "Improved player and squad applying speed.",
+        "Improved set and multi-solve stability.",
+        "Cleaner solver controls and feedback."
+      ]
+    }
+  ]
+}
