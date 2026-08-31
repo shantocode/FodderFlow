@@ -17,8 +17,11 @@
       "48": "icons/icon48.png"
     }
   },
-  "permissions": ["storage", "scripting"],
-  "host_permissions": ["https://www.fut.gg/*"],
+  "permissions": ["storage", "scripting", "alarms", "tabs"],
+  "host_permissions": [
+    "https://www.fut.gg/*",
+    "https://raw.githubusercontent.com/*"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"

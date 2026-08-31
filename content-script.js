@@ -125,8 +125,77 @@ const exposeExtensionMetadataToPage = async () => {
   }
 };
 
+const FF_UPDATE_OVERLAY_ID = "ff-update-required-overlay";
+
+const getUpdateStatus = () =>
+  new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ type: "FF_GET_UPDATE_STATUS" }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve(null);
+          return;
+        }
+        resolve(response?.data || null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+
+const renderUpdateRequiredOverlay = (status) => {
+  if (document.getElementById(FF_UPDATE_OVERLAY_ID)) return;
+  const host = document.body || document.documentElement;
+  if (!host) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = FF_UPDATE_OVERLAY_ID;
+  overlay.style.cssText =
+    "position:fixed;inset:0;z-index:2147483647;background:rgba(10,10,14,0.92);" +
+    "display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;";
+
+  const card = document.createElement("div");
+  card.style.cssText =
+    "background:#17181d;color:#f3f3f3;padding:28px 32px;border-radius:12px;" +
+    "max-width:420px;text-align:center;box-shadow:0 12px 40px rgba(0,0,0,0.5);";
+
+  const latest = status?.latestVersion ? String(status.latestVersion) : "a newer version";
+  const current = status?.currentVersion ? String(status.currentVersion) : "";
+
+  card.innerHTML =
+    `<div style="font-size:18px;font-weight:700;margin-bottom:8px;">Update required</div>` +
+    `<div style="font-size:14px;line-height:1.5;opacity:0.85;margin-bottom:18px;">` +
+    `AutopilotSBC ${current ? `(v${current}) ` : ""}is out of date. Version ${latest} is available ` +
+    `and this extension won't run until you update.</div>` +
+    `<button id="ff-update-now-btn" style="background:#2f7dfa;color:#fff;border:none;` +
+    `padding:10px 20px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;">` +
+    `Get update</button>` +
+    `<div style="font-size:12px;opacity:0.6;margin-top:14px;">` +
+    `Opens the latest download. Replace the old extension folder, then reload it from ` +
+    `chrome://extensions.</div>`;
+
+  overlay.appendChild(card);
+  host.appendChild(overlay);
+
+  const btn = card.querySelector("#ff-update-now-btn");
+  btn?.addEventListener("click", () => {
+    try {
+      chrome.runtime.sendMessage({
+        type: "FF_OPEN_UPDATE_LINK",
+        url: status?.releaseUrl,
+      });
+    } catch {}
+  });
+};
+
 void (async () => {
   if (window !== window.top) return;
+
+  const updateStatus = await getUpdateStatus();
+  if (updateStatus?.updateAvailable) {
+    renderUpdateRequiredOverlay(updateStatus);
+    return; // Block: do not inject the page bridge / enable the extension.
+  }
+
   await exposeExtensionMetadataToPage();
   const bridgePath = "page/ea-data-bridge.js";
   try {

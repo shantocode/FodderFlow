@@ -34,6 +34,12 @@ import {
   buildSolverContext,
   solveSquad,
 } from "./solver/solver.js?v=2026-02-22d";
+import {
+  initUpdateChecker,
+  handleUpdateStatusMessage,
+} from "./update-checker.js";
+
+initUpdateChecker();
 
 console.log("[EA Data] Background loaded", {
   mode: "direct",
@@ -489,6 +495,18 @@ const handleFutPlayersRequest = (message, sendResponse) => {
 };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (
+    message?.type === "FF_GET_UPDATE_STATUS" ||
+    message?.type === "FF_FORCE_UPDATE_CHECK"
+  ) {
+    handleUpdateStatusMessage(message, sendResponse);
+    return true;
+  }
+  if (message?.type === "FF_OPEN_UPDATE_LINK") {
+    const url = message?.url || "https://github.com/shantocode/FodderFlow/releases/latest";
+    chrome.tabs.create({ url });
+    return false;
+  }
   if (message?.type === BRIDGE_INJECT_REQUEST) {
     handleBridgeInjectRequest(message, sender, sendResponse);
     return true;
