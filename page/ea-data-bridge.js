@@ -542,7 +542,7 @@
   const DEFAULT_SEARCH_PAGE_DELAY_SECONDS = 0.25;
   const APPLY_LOOKUP_FAST_PAGE_DELAY_SECONDS = 0.12;
   const APPLY_LOOKUP_ADAPTIVE_PROFILE_KEY = "apply-lookup";
-  const APPLY_LOOKUP_ADAPTIVE_COOLDOWN_MS = 45 * 1000;
+  const APPLY_LOOKUP_ADAPTIVE_COOLDOWN_MS = 5 * 1000;
   const APPLY_LOOKUP_WARM_CACHE_TTL_MS = 180 * 1000;
   const adaptivePageDelayStateByProfile = new Map();
   let recentApplyLookupCache = null;
@@ -3224,12 +3224,90 @@
     return currentSlotPlan;
   };
 
+  // --- Solve counter (display-only; does not throttle or block anything) ---
+  const SOLVE_COUNTER_STORAGE_KEY = "eaDataSolveCounterLog";
+  const SOLVE_COUNTER_HOUR_MS = 60 * 60 * 1000;
+  const SOLVE_COUNTER_DAY_MS = 24 * 60 * 60 * 1000;
+
+  const readSolveCounterLog = () => {
+    try {
+      const raw = localStorage.getItem(SOLVE_COUNTER_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((ts) => typeof ts === "number") : [];
+    } catch {
+      return [];
+    }
+  };
+
+  const writeSolveCounterLog = (entries) => {
+    try {
+      localStorage.setItem(SOLVE_COUNTER_STORAGE_KEY, JSON.stringify(entries));
+    } catch {}
+  };
+
+  const getSolveCounts = () => {
+    const now = Date.now();
+    const log = readSolveCounterLog().filter((ts) => now - ts < SOLVE_COUNTER_DAY_MS);
+    const lastHour = log.filter((ts) => now - ts < SOLVE_COUNTER_HOUR_MS).length;
+    return { lastHour, last24h: log.length };
+  };
+
+  // Inline counter line, rendered into the SBC hub header (see ensureSequenceHubEntry).
+  // Display-only: shows how many saves happened, does not cap or block anything.
+  const SOLVE_COUNTER_LINE_ID = "ea-data-solve-counter-line";
+
+  const ensureSolveCounterLine = (wrapper) => {
+    if (!(wrapper instanceof HTMLElement)) return null;
+    const parent = wrapper.parentElement;
+    let el = parent?.querySelector?.(`#${SOLVE_COUNTER_LINE_ID}`) ?? null;
+    if (!(el instanceof HTMLElement)) {
+      el = document.createElement("div");
+      el.id = SOLVE_COUNTER_LINE_ID;
+      el.style.cssText =
+        "display:block;width:100%;" +
+        "font:700 16px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;" +
+        "color:#fff;text-align:center;padding:4px 0 2px;letter-spacing:.2px;";
+    }
+    if (parent && el.nextElementSibling !== wrapper) {
+      try {
+        parent.insertBefore(el, wrapper);
+      } catch {}
+    }
+    return el;
+  };
+
+  const updateSolveCounterDisplay = () => {
+    const { lastHour, last24h } = getSolveCounts();
+    const wrapper = document.querySelector(
+      '[data-ea-data-sequence-entry="true"]',
+    );
+    const el =
+      wrapper?.parentElement?.querySelector?.(`#${SOLVE_COUNTER_LINE_ID}`) ??
+      ensureSolveCounterLine(wrapper);
+    if (el) el.textContent = `SBC Solve Count — Hourly: ${lastHour}/90 | Daily: ${last24h}/300`;
+  };
+
+  const recordSolveEvent = () => {
+    const now = Date.now();
+    const trimmed = readSolveCounterLog().filter((ts) => now - ts < SOLVE_COUNTER_DAY_MS);
+    trimmed.push(now);
+    writeSolveCounterLog(trimmed);
+    updateSolveCounterDisplay();
+  };
+
+  // (Nothing to render at load time — the line is created inside the SBC hub
+  // header itself via ensureSequenceHubEntry, once that view mounts.)
+  // --- end solve counter ---
+
   const saveChallenge = (challenge) =>
     sbcApiCall(
       "saveChallenge",
       () => observableToPromise(services.SBC.saveChallenge(challenge)),
       { minGapMs: SBC_AUTOMATION_MIN_GAP_MS, maxAttempts: 3 },
-    );
+    ).then((result) => {
+      recordSolveEvent();
+      return result;
+    });
 
   const applySolutionToChallenge = async (challenge, ids, options = {}) => {
     if (!challenge?.squad) return [];
@@ -21202,6 +21280,8 @@
     }
 
     syncSequenceHubEntryButton(button);
+    ensureSolveCounterLine(wrapper);
+    updateSolveCounterDisplay();
     if (
       wrapper.parentElement !== container ||
       wrapper.nextElementSibling !== grid
@@ -30533,12 +30613,685 @@
   }
   scheduleSolverBridgeInit();
 
+  // ============================================================
+  // PACK QUICK OPEN (added without removing/replacing existing code)
+  // Based on the EA internal pack flow used by the reference enhancer.
+  // This only adds a quick-open control and animation bypass; the
+  // normal EA OPEN action remains responsible for actually opening.
+  // ============================================================
+  const packQuickOpenState = {
+    fastPackOpen: false,
+    initialized: false,
+    animationHooked: false,
+    detailHooked: false,
+  };
+
+  const initPackQuickOpenAnimationHook = () => {
+    try {
+      const animationProto = globalThis?.UTPackAnimationViewController?.prototype;
+      const presentationProto = globalThis?.UTPresentationController?.prototype;
+      if (!animationProto || !presentationProto) return false;
+
+      // Match the enhancer behavior: while quick-open is armed, skip the
+      // animation callback instead of running the normal pack animation.
+      if (typeof animationProto.runAnimation === "function" &&
+          !animationProto.runAnimation.__fodderFlowQuickOpen) {
+        const originalRunAnimation = animationProto.runAnimation;
+        const patchedRunAnimation = function (...args) {
+          if (packQuickOpenState.fastPackOpen) {
+            // Do NOT clear the flag before UTPresentationController.present
+            // gets a chance to see it. The reference enhancer keeps the flag
+            // set during this transition as well.
+            const callback = this?.runCallback;
+            let result;
+            if (typeof callback === "function") {
+              result = callback.call(this);
+            } else {
+              result = undefined;
+            }
+            // Prevent the flag from affecting a later, unrelated pack open.
+            setTimeout(() => {
+              packQuickOpenState.fastPackOpen = false;
+            }, 1500);
+            return result;
+          }
+          return originalRunAnimation.call(this, ...args);
+        };
+        patchedRunAnimation.__fodderFlowQuickOpen = true;
+        animationProto.runAnimation = patchedRunAnimation;
+      }
+
+      if (typeof presentationProto.present === "function" &&
+          !presentationProto.present.__fodderFlowQuickOpen) {
+        const originalPresent = presentationProto.present;
+        const patchedPresent = function (show, ...args) {
+          if (
+            packQuickOpenState.fastPackOpen &&
+            globalThis?.UTPackAnimationViewController &&
+            this?.presentedViewController instanceof globalThis.UTPackAnimationViewController
+          ) {
+            show = false;
+          }
+          return originalPresent.call(this, show, ...args);
+        };
+        patchedPresent.__fodderFlowQuickOpen = true;
+        presentationProto.present = patchedPresent;
+      }
+
+      packQuickOpenState.animationHooked =
+        !!animationProto.runAnimation.__fodderFlowQuickOpen &&
+        !!presentationProto.present.__fodderFlowQuickOpen;
+      return packQuickOpenState.animationHooked;
+    } catch (error) {
+      console.warn("[Fodder Flow] Pack animation hook failed", error);
+      return false;
+    }
+  };
+
+  const initPackQuickOpen = () => {
+    if (packQuickOpenState.detailHooked) return true;
+    try {
+      const detailProto = globalThis?.UTStorePackDetailsView?.prototype;
+      if (!detailProto || typeof detailProto.setupOpenButton !== "function") {
+        return false;
+      }
+
+      const originalSetupOpenButton = detailProto.setupOpenButton;
+      if (originalSetupOpenButton.__fodderFlowQuickOpen) {
+        packQuickOpenState.detailHooked = true;
+        return true;
+      }
+
+      detailProto.setupOpenButton = function (...args) {
+        const result = originalSetupOpenButton.call(this, ...args);
+
+        try {
+          // Avoid duplicate controls when EA rebuilds the view.
+          if (!this.custom_fodderFlowQuickOpen &&
+              typeof globalThis.UTCurrencyButtonControl === "function" &&
+              typeof this.appendActionButton === "function") {
+            const button = new globalThis.UTCurrencyButtonControl();
+            button.init();
+            button.setText("Quick Open Pack");
+            if (typeof button.addClass === "function") {
+              button.addClass("call-to-action quick-open btn-standard primary");
+            }
+            if (typeof button.addTarget === "function") {
+              const tapEvent = globalThis.EventType?.TAP;
+              const openEvent = globalThis.UTStorePackDetailsView?.Event?.OPEN;
+              if (tapEvent && openEvent && typeof this._triggerActions === "function") {
+                button.addTarget(this, () => {
+                  packQuickOpenState.fastPackOpen = true;
+                  this._triggerActions(openEvent, {
+                    articleId:
+                      typeof this.getArticleId === "function"
+                        ? this.getArticleId()
+                        : this.articleId,
+                  });
+                }, tapEvent);
+                this.appendActionButton(button);
+                this.custom_fodderFlowQuickOpen = button;
+              }
+            }
+          }
+        } catch (error) {
+          console.warn("[Fodder Flow] Quick Open button setup failed", error);
+        }
+
+        return result;
+      };
+
+      detailProto.setupOpenButton.__fodderFlowQuickOpen = true;
+      packQuickOpenState.detailHooked = true;
+      packQuickOpenState.initialized = true;
+      return true;
+    } catch (error) {
+      console.warn("[Fodder Flow] Quick Open hook failed", error);
+      return false;
+    }
+  };
+
+  const initPackQuickOpenHooks = () => {
+    initPackQuickOpenAnimationHook();
+    initPackQuickOpen();
+    return {
+      animationHooked: packQuickOpenState.animationHooked,
+      detailHooked: packQuickOpenState.detailHooked,
+    };
+  };
+
+  // EA constructs its store controllers lazily. Start polling immediately so
+  // the hooks are installed before the user opens a pack, without requiring
+  // a manual call from the console.
+  const startPackQuickOpenHookPolling = () => {
+    let attempts = 0;
+    const maxAttempts = 120;
+    const tick = () => {
+      attempts += 1;
+      const status = initPackQuickOpenHooks();
+      if (status.animationHooked && status.detailHooked) {
+        return true;
+      }
+      if (attempts >= maxAttempts) {
+        console.warn("[Fodder Flow] Pack quick-open hook polling timed out", status);
+        return true;
+      }
+      return false;
+    };
+
+    if (tick()) return;
+    const intervalId = setInterval(() => {
+      if (tick()) clearInterval(intervalId);
+    }, 250);
+
+    // Navigation in the Web App can recreate controller prototypes/views.
+    // Give the hooks another chance after navigation without touching any
+    // existing Fodder Flow hooks.
+    try {
+      window.addEventListener("hashchange", () => initPackQuickOpenHooks());
+      window.addEventListener("popstate", () => initPackQuickOpenHooks());
+      window.addEventListener("focus", () => initPackQuickOpenHooks(), { passive: true });
+    } catch {}
+  };
+
+  startPackQuickOpenHookPolling();
+
   const logResult = (label, data) => {
     console.log(`[EA Data] ${label}`, data);
     return data;
   };
 
+
+  // ============================================================
+  // PACK: OPEN ALL MY PACKS (additive)
+  // Sequentially opens the packs already present in My Packs using
+  // EA's own pack entity. No direct HTTP calls or concurrent opens.
+  // A small delay is used between opens; this cannot guarantee that
+  // EA will consider automation permitted, so the feature should be
+  // used only where allowed by EA's rules.
+  // ============================================================
+  const openAllPacksState = {
+    running: false,
+    stopRequested: false,
+    opened: 0,
+    total: 0,
+    lastResults: [],
+    button: null,
+    wrapper: null,
+  };
+
+  const packAutomationDelay = (min = 4500, max = 6500) =>
+    Math.floor(min + Math.random() * Math.max(1, max - min));
+
+  const getPackItemName = (item) => {
+    try {
+      const name = resolveItemEntityDisplayName(item);
+      if (name) return name;
+    } catch {}
+    return "Unknown item";
+  };
+
+  const getPackItemRating = (item) => {
+    const value = Number(item?.rating);
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  const getPackItemImage = (item) => {
+    try {
+      const root =
+        typeof item?.getRootElement === "function"
+          ? item.getRootElement()
+          : null;
+      const img = root?.querySelector?.("img[src]");
+      return img?.src || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const makePackResultData = (pack, response) => {
+    // EA pack.open() resolves to an operation result whose actual reward
+    // items are normally under response.items. Some builds wrap that result
+    // one level deeper, so support all observed shapes.
+    const rawItems = Array.isArray(response?.items)
+      ? response.items
+      : Array.isArray(response?.response?.items)
+        ? response.response.items
+        : Array.isArray(response?.data?.items)
+          ? response.data.items
+          : [];
+    const items = rawItems.map((item, index) => ({
+      index,
+      name: getPackItemName(item),
+      rating: getPackItemRating(item),
+      definitionId: item?.definitionId ?? null,
+      image: getPackItemImage(item),
+      isPlayer: isPlayerItemEntity(item),
+      untradeable:
+        typeof item?.isTradeable === "function"
+          ? !item.isTradeable()
+          : item?.isTradeable === false,
+    }));
+    const topCard =
+      items
+        .filter((item) => item.isPlayer || item.rating > 0)
+        .sort((a, b) => b.rating - a.rating)[0] ?? items[0] ?? null;
+    return {
+      packName:
+        typeof pack?.getPackName === "function"
+          ? pack.getPackName()
+          : pack?.packName ?? pack?.name ?? "Pack",
+      packId: pack?.id ?? null,
+      success: response?.success === true,
+      status: response?.status ?? null,
+      items,
+      topCard,
+    };
+  };
+
+  const ensureOpenAllPacksStyles = () => {
+    if (document.getElementById("fodder-flow-open-all-packs-style")) return;
+    const style = document.createElement("style");
+    style.id = "fodder-flow-open-all-packs-style";
+    style.textContent = `
+      .fodder-flow-pack-actions {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        margin: 0 auto 12px;
+        width: min(92%, 720px);
+      }
+      .fodder-flow-open-all-packs {
+        width: 100%;
+        min-height: 42px;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 1rem;
+        font-weight: 700;
+        color: #fff;
+        background: linear-gradient(90deg, rgba(35, 180, 210, .9), rgba(88, 75, 205, .9));
+      }
+      .fodder-flow-open-all-packs:disabled {
+        opacity: .55;
+        cursor: default;
+      }
+      .fodder-flow-pack-results {
+        position: fixed;
+        z-index: 2147483646;
+        left: 50%;
+        top: 8%;
+        transform: translateX(-50%);
+        width: min(680px, calc(100vw - 32px));
+        max-height: 78vh;
+        overflow: auto;
+        padding: 18px;
+        border-radius: 12px;
+        background: rgba(20, 20, 30, .97);
+        border: 1px solid rgba(255,255,255,.18);
+        box-shadow: 0 18px 60px rgba(0,0,0,.55);
+        color: #fff;
+        font-family: inherit;
+      }
+      .fodder-flow-pack-results__top {
+        display: flex;
+        gap: 14px;
+        align-items: center;
+        padding: 14px;
+        margin-bottom: 14px;
+        border-radius: 10px;
+        background: rgba(255,255,255,.08);
+      }
+      .fodder-flow-pack-results__card {
+        width: 92px;
+        min-width: 92px;
+        min-height: 118px;
+        border-radius: 8px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        background: linear-gradient(160deg, #e7e7e7, #777);
+        color: #111;
+        font-weight: 800;
+      }
+      .fodder-flow-pack-results__card img {
+        max-width: 100%;
+        max-height: 86px;
+        object-fit: contain;
+      }
+      .fodder-flow-pack-results__rating { font-size: 1.7rem; }
+      .fodder-flow-pack-results__name { font-size: .82rem; }
+      .fodder-flow-pack-results__items {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+        gap: 8px;
+      }
+      .fodder-flow-pack-results__item {
+        padding: 9px 11px;
+        border-radius: 7px;
+        background: rgba(255,255,255,.06);
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      .fodder-flow-pack-results__close {
+        margin-top: 14px;
+        width: 100%;
+        min-height: 38px;
+        border: 0;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+    `;
+    document.head.appendChild(style);
+  };
+
+  let packResultOverlay = null;
+
+  const hidePackResultOverlay = () => {
+    try {
+      packResultOverlay?.remove();
+    } catch {}
+    packResultOverlay = null;
+  };
+
+  const showPackResultOverlay = (result, current, total) => {
+    ensureOpenAllPacksStyles();
+    hidePackResultOverlay();
+    const overlay = document.createElement("div");
+    overlay.className = "fodder-flow-pack-results";
+    overlay.setAttribute("role", "dialog");
+
+    const title = document.createElement("h2");
+    title.textContent = `${result.packName} — Pack ${current}/${total}`;
+    title.style.margin = "0 0 12px";
+    overlay.appendChild(title);
+
+    if (result.topCard) {
+      const top = document.createElement("div");
+      top.className = "fodder-flow-pack-results__top";
+      const card = document.createElement("div");
+      card.className = "fodder-flow-pack-results__card";
+      if (result.topCard.image) {
+        const img = document.createElement("img");
+        img.src = result.topCard.image;
+        img.alt = "Top card";
+        card.appendChild(img);
+      }
+      const rating = document.createElement("div");
+      rating.className = "fodder-flow-pack-results__rating";
+      rating.textContent = result.topCard.rating ? String(result.topCard.rating) : "—";
+      card.appendChild(rating);
+      const name = document.createElement("div");
+      name.className = "fodder-flow-pack-results__name";
+      name.textContent = result.topCard.name;
+      card.appendChild(name);
+      const label = document.createElement("div");
+      label.innerHTML = `<strong>TOP CARD</strong><div>${result.topCard.name}</div>`;
+      top.appendChild(card);
+      top.appendChild(label);
+      overlay.appendChild(top);
+    }
+
+    const itemsWrap = document.createElement("div");
+    itemsWrap.className = "fodder-flow-pack-results__items";
+    for (const item of result.items) {
+      const row = document.createElement("div");
+      row.className = "fodder-flow-pack-results__item";
+      const left = document.createElement("span");
+      left.textContent = item.name;
+      const right = document.createElement("strong");
+      right.textContent = item.rating ? String(item.rating) : "";
+      row.append(left, right);
+      itemsWrap.appendChild(row);
+    }
+    overlay.appendChild(itemsWrap);
+
+    const close = document.createElement("button");
+    close.className = "fodder-flow-pack-results__close";
+    close.textContent = "Close results";
+    close.addEventListener("click", hidePackResultOverlay);
+    overlay.appendChild(close);
+
+    document.body.appendChild(overlay);
+    packResultOverlay = overlay;
+  };
+
+  const getMyPackEntities = async (view) => {
+    // IMPORTANT: UTStoreView.setPacks receives the actual EA pack entities.
+    // Do not replace these with the plain objects returned by getPacks(),
+    // because only the entity exposes EA's open() operation.
+    const fromSetPacks = Array.isArray(view?.__fodderFlowMyPackEntities)
+      ? view.__fodderFlowMyPackEntities
+      : [];
+    if (fromSetPacks.length) return fromSetPacks.filter(Boolean);
+
+    // Some EA builds expose the entity list directly as storePacks.
+    const fromView = Array.isArray(view?.storePacks) ? view.storePacks : [];
+    if (fromView.length) {
+      const openable = fromView.filter((pack) => typeof pack?.open === "function");
+      if (openable.length) return openable;
+    }
+
+    console.warn("[Fodder Flow] My Packs view did not expose EA pack entities.");
+    return [];
+  };
+
+  const openAllMyPacks = async (view) => {
+    if (openAllPacksState.running) return;
+    openAllPacksState.running = true;
+    openAllPacksState.stopRequested = false;
+    openAllPacksState.opened = 0;
+    openAllPacksState.lastResults = [];
+
+    const button = openAllPacksState.button;
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Opening Packs…";
+    }
+
+    try {
+      const packs = await getMyPackEntities(view);
+      openAllPacksState.total = packs.length;
+      if (!packs.length) {
+        showToast({
+          type: "info",
+          title: "Open All Packs",
+          message: "No My Packs were found.",
+        });
+        return;
+      }
+
+      for (const pack of packs) {
+        if (openAllPacksState.stopRequested) break;
+
+        // Match the enhancer's safety check: never open another pack while
+        // the purchased/unassigned pile still contains items.
+        try {
+          if (globalThis?.repositories?.Item &&
+              globalThis?.ItemPile?.PURCHASED !== undefined &&
+              typeof repositories.Item.numItemsInCache === "function" &&
+              repositories.Item.numItemsInCache(ItemPile.PURCHASED)) {
+            showToast({
+              type: "error",
+              title: "Open All Packs stopped",
+              message: "There are still unassigned pack items. Clear them before continuing.",
+            });
+            break;
+          }
+        } catch {}
+
+        const packName =
+          typeof pack?.getPackName === "function"
+            ? pack.getPackName()
+            : pack?.packName ?? pack?.name ?? "Pack";
+        if (!pack || typeof pack.open !== "function") {
+          showToast({
+            type: "error",
+            title: "Open All Packs",
+            message: `${packName}: EA pack open method unavailable.`,
+          });
+          break;
+        }
+
+        try {
+          // Reuse the already-tested quick-open animation path.
+          packQuickOpenState.fastPackOpen = true;
+          const response = await observableToPromise(pack.open());
+          const result = makePackResultData(pack, response);
+          openAllPacksState.lastResults.push(result);
+          openAllPacksState.opened += 1;
+          showPackResultOverlay(
+            result,
+            openAllPacksState.opened,
+            openAllPacksState.total,
+          );
+          showToast({
+            type: result.success ? "success" : "error",
+            title: `${openAllPacksState.opened}/${openAllPacksState.total} opened`,
+            message: result.topCard
+              ? `Top card: ${result.topCard.name} (${result.topCard.rating || "—"})`
+              : packName,
+          });
+
+          // Keep each result visible for a short period, then close it before
+          // the next pack. This makes the sequence readable without stacking
+          // multiple result dialogs.
+          await delayMs(3500);
+          hidePackResultOverlay();
+          await delayMs(packAutomationDelay(2500, 4500));
+        } catch (error) {
+          packQuickOpenState.fastPackOpen = false;
+          showToast({
+            type: "error",
+            title: "Pack opening stopped",
+            message: error?.message || `${packName} failed to open.`,
+          });
+          break;
+        } finally {
+          setTimeout(() => {
+            packQuickOpenState.fastPackOpen = false;
+          }, 1000);
+        }
+      }
+    } finally {
+      openAllPacksState.running = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Open All Packs";
+      }
+      if (!openAllPacksState.stopRequested && openAllPacksState.opened) {
+        showToast({
+          type: "success",
+          title: "Open All Packs finished",
+          message: `${openAllPacksState.opened}/${openAllPacksState.total} packs opened.`,
+          timeoutMs: 2500,
+        });
+      }
+    }
+  };
+
+  const cleanupOpenAllPacksButton = (view) => {
+    try {
+      view?.__fodderFlowOpenAllPacksWrapper?.remove();
+    } catch {}
+    try {
+      if (view) {
+        view.__fodderFlowOpenAllPacksButton = null;
+        view.__fodderFlowOpenAllPacksWrapper = null;
+        // Keep the EA pack entities captured by setPacks(). The Open All
+        // button needs those same entity instances because they expose open().
+        // They are replaced automatically the next time setPacks() runs.
+        if (!Array.isArray(view.__fodderFlowMyPackEntities)) {
+          view.__fodderFlowMyPackEntities = [];
+        }
+      }
+    } catch {}
+    openAllPacksState.button = null;
+    openAllPacksState.wrapper = null;
+  };
+
+  const initOpenAllPacks = () => {
+    try {
+      const proto = globalThis?.UTStoreView?.prototype;
+      if (!proto || typeof proto.setPacks !== "function") return false;
+      if (proto.setPacks.__fodderFlowOpenAllPacks) return true;
+
+      const originalSetPacks = proto.setPacks;
+      proto.setPacks = function (packs, ...args) {
+        // Preserve the exact EA entities passed into setPacks. These are the
+        // objects that implement open(), unlike the plain API data objects.
+        const isMyPacksGroup =
+          Array.isArray(packs) &&
+          packs.length > 0 &&
+          (packs[0]?.displayGroup === "mypacks" ||
+            packs.some((pack) => pack?.displayGroup === "mypacks"));
+        this.__fodderFlowMyPackEntities = isMyPacksGroup
+          ? packs.filter(Boolean).slice()
+          : [];
+        const result = originalSetPacks.call(this, packs, ...args);
+        try {
+          cleanupOpenAllPacksButton(this);
+          if (
+            isMyPacksGroup &&
+            this.__itemList
+          ) {
+            ensureOpenAllPacksStyles();
+            const wrapper = document.createElement("div");
+            wrapper.className = "fodder-flow-pack-actions";
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "fodder-flow-open-all-packs";
+            button.textContent = `Open All Packs (${packs.length})`;
+            button.addEventListener("click", () => openAllMyPacks(this));
+            wrapper.appendChild(button);
+            this.__itemList.prepend(wrapper);
+            this.__fodderFlowOpenAllPacksWrapper = wrapper;
+            this.__fodderFlowOpenAllPacksButton = button;
+            openAllPacksState.button = button;
+            openAllPacksState.wrapper = wrapper;
+          }
+        } catch (error) {
+          console.warn("[Fodder Flow] Open All Packs UI failed", error);
+        }
+        return result;
+      };
+      proto.setPacks.__fodderFlowOpenAllPacks = true;
+
+      const originalDestroy = proto.destroyGeneratedElements;
+      if (typeof originalDestroy === "function" && !originalDestroy.__fodderFlowOpenAllPacks) {
+        proto.destroyGeneratedElements = function (...args) {
+          cleanupOpenAllPacksButton(this);
+          return originalDestroy.call(this, ...args);
+        };
+        proto.destroyGeneratedElements.__fodderFlowOpenAllPacks = true;
+      }
+      return true;
+    } catch (error) {
+      console.warn("[Fodder Flow] Open All Packs hook failed", error);
+      return false;
+    }
+  };
+
+  // Keep retrying because EA creates the store view lazily.
+  const startOpenAllPacksHookPolling = () => {
+    let attempts = 0;
+    const intervalId = setInterval(() => {
+      attempts += 1;
+      if (initOpenAllPacks() || attempts >= 120) clearInterval(intervalId);
+    }, 250);
+    initOpenAllPacks();
+  };
+
+  startOpenAllPacksHookPolling();
+
   window.eaData = {
+    // Pack quick-open helpers (additive; existing API preserved).
+    initPackQuickOpen: () => initPackQuickOpenHooks(),
+    getPackQuickOpenStatus: () => ({ ...packQuickOpenState }),
     openSequenceSolver: () => openSequenceSolveOverlay(),
     openSequencePlanner: () => openSequenceSolveOverlay(),
     openWhatsNew: () => openWhatsNewOverlay({ source: "manual" }),
