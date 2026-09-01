@@ -41,6 +41,24 @@ import {
 
 initUpdateChecker();
 
+const reloadOpenEaWebAppTabs = async () => {
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(
+      tabs
+        .filter(
+          (tab) => tab?.id != null && EA_WEBAPP_URL_RE.test(String(tab.url || "")),
+        )
+        .map((tab) => chrome.tabs.reload(tab.id).catch(() => {})),
+    );
+  } catch {}
+};
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details?.reason !== "install" && details?.reason !== "update") return;
+  void reloadOpenEaWebAppTabs();
+});
+
 console.log("[EA Data] Background loaded", {
   mode: "direct",
   workerAvailable: typeof Worker !== "undefined",

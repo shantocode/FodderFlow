@@ -402,11 +402,11 @@
     return !(typeof shouldAbort === "function" && shouldAbort());
   };
 
-  // SBC automation can trigger FUT rate limits if we save/submit too quickly.
-  // We only pace/retry calls while an automation flow is active (ex: multi-submit).
-  const SBC_AUTOMATION_MIN_GAP_MS = 950;
-  const SBC_AUTOMATION_SUBMIT_MIN_GAP_MS = 2200;
-  const SBC_AUTOMATION_JITTER_PCT = 0.25;
+  // Requests remain sequential; only actual temporary failures trigger backoff.
+  const SBC_AUTOMATION_MIN_GAP_MS = 0;
+  const SBC_QUEUE_REFRESH_MIN_GAP_MS = 0;
+  const SBC_AUTOMATION_SUBMIT_MIN_GAP_MS = 0;
+  const SBC_AUTOMATION_JITTER_PCT = 0;
   const SBC_AUTOMATION_BACKOFF_BASE_MS = 2500;
   const SBC_AUTOMATION_BACKOFF_MAX_MS = 20000;
   let sbcAutomationDepth = 0;
@@ -891,6 +891,67 @@
     return "";
   };
 
+  const getEaContentHash = () => {
+    try {
+      const node = document.querySelector('img[src*="/web-app/content/"]');
+      const match = String(node?.src ?? "").match(/\/content\/([^/]+)\//);
+      if (match?.[1]) return match[1];
+    } catch {}
+    return "26E4D4D6-8DBB-4A9A-BD99-9C47D3AA341D";
+  };
+
+  const getPlayerImageCandidates = (player) => {
+    if (!player || typeof player !== "object") return [];
+    const candidates = [];
+    const add = (value) => {
+      const url = typeof value === "string" ? value.trim() : "";
+      if (url && !candidates.includes(url)) candidates.push(url);
+    };
+    const encodedPlayerId =
+      readNumeric(player?.assetId) ??
+      readNumeric(player?.resourceId) ??
+      readNumeric(player?.definitionId);
+    const assetId =
+      encodedPlayerId == null ? null : encodedPlayerId % 16777216;
+    const base = `https://www.ea.com/ea-sports-fc/ultimate-team/web-app/content/${getEaContentHash()}/2026/fut`;
+    if (assetId != null) {
+      add(`${base}/items/images/players/html5/120x120/p${assetId}.png`);
+    } else {
+      add(player?.imageUrl);
+      add(player?.largeImgUrl);
+      add(player?.imgUrl);
+      add(player?.headshot?.largeImgUrl);
+      add(player?.headshot?.imgUrl);
+      add(player?._staticData?.imageUrl);
+      add(player?._staticData?.largeImgUrl);
+    }
+    return candidates;
+  };
+
+  const createPreviewPlayerImage = (rowData) => {
+    const wrap = document.createElement("div");
+    wrap.className = "ea-data-preview-card-image";
+    const candidates = Array.isArray(rowData?.imageCandidates)
+      ? rowData.imageCandidates.slice()
+      : [];
+    const fallback = document.createElement("span");
+    fallback.textContent = String(rowData?.rating ?? "?");
+    wrap.append(fallback);
+    if (!candidates.length) return wrap;
+    const img = document.createElement("img");
+    img.alt = `${String(rowData?.name ?? "Player")} card`;
+    let index = 0;
+    img.addEventListener("load", () => wrap.classList.add("is-loaded"));
+    img.addEventListener("error", () => {
+      index += 1;
+      if (index < candidates.length) img.src = candidates[index];
+      else img.remove();
+    });
+    img.src = candidates[0];
+    wrap.append(img);
+    return wrap;
+  };
+
   const buildPreviewRows = ({
     solutionIds = [],
     slotSolution = null,
@@ -951,8 +1012,13 @@
         rarity,
         qualityLabel,
         definitionId,
+        imageCandidates: getPlayerImageCandidates(player),
         priceLookupId,
         isSpecial: Boolean(player?.isSpecial),
+        preferredPositionName:
+          sanitizeDisplayText(player?.preferredPositionName) ?? posLabel,
+        clubName: resolveEntityClubName(player),
+        nationName: resolveEntityNationName(player),
         chemVal: perChem?.[index],
         onPosVal: onPos?.[index],
         priceMeta: readCachedPlayerPrice(priceLookupId),
@@ -975,6 +1041,39 @@
     }
 
     return rows;
+  };
+
+  const createPreviewPlayerIdentity = (rowData) => {
+    const left = document.createElement("div");
+    left.className = "ea-data-preview-left";
+
+    const primary = document.createElement("div");
+    primary.className = "ea-data-preview-primary";
+    const rating = document.createElement("div");
+    rating.className = "ea-data-preview-rating";
+    rating.textContent = String(rowData?.rating ?? "?");
+    const name = document.createElement("div");
+    name.className = "ea-data-preview-name";
+    name.textContent = String(rowData?.name ?? "Unknown");
+    name.title = name.textContent;
+    primary.append(rating, name);
+
+    const secondary = document.createElement("div");
+    secondary.className = "ea-data-preview-player-meta";
+    secondary.textContent = [
+      rowData?.rarity,
+      rowData?.preferredPositionName,
+      rowData?.clubName,
+      rowData?.nationName,
+    ]
+      .map(sanitizeDisplayText)
+      .filter((value, index, values) => value && values.indexOf(value) === index)
+      .join(" · ");
+    secondary.title = secondary.textContent;
+
+    left.append(primary);
+    if (secondary.textContent) left.append(secondary);
+    return left;
   };
 
   const renderPreviewRowsMarkup = (rows = []) => {
@@ -1016,6 +1115,18 @@
             <div class="ea-data-preview-pos">${escapeHtml(
               row?.posLabel ?? "Slot",
             )}</div>
+            <div class="ea-data-preview-card-image${
+              row?.imageCandidates?.length ? " has-image" : ""
+            }">
+              <span>${escapeHtml(row?.rating ?? "?")}</span>
+              ${
+                row?.imageCandidates?.[0]
+                  ? `<img src="${escapeHtml(row.imageCandidates[0])}" alt="${escapeHtml(
+                      `${row?.name ?? "Player"} card`,
+                    )}" />`
+                  : ""
+              }
+            </div>
             <div class="ea-data-preview-main">
               <div class="ea-data-preview-left">
                 <div class="ea-data-preview-rating">${escapeHtml(
@@ -1582,6 +1693,31 @@
       entity?._staticData?.nationality ??
       null;
     return sanitizeDisplayText(getNationName(nationId));
+  };
+
+  const resolveEntityClubName = (entity) => {
+    if (!entity || typeof entity !== "object") return null;
+    const direct = sanitizeDisplayText(
+      entity?.clubName ??
+        entity?.teamName ??
+        entity?.club?.name ??
+        entity?.team?.name ??
+        entity?._staticData?.clubName ??
+        entity?._staticData?.teamName ??
+        null,
+    );
+    if (direct) return direct;
+    return sanitizeDisplayText(
+      getClubName(
+        entity?.teamId ??
+          entity?.clubId ??
+          entity?.team?.id ??
+          entity?.club?.id ??
+          entity?._staticData?.teamId ??
+          entity?._staticData?.clubId ??
+          null,
+      ),
+    );
   };
 
   const EXCLUDED_PLAYER_META_STORAGE_KEY = "eaData.excludedPlayerMeta.v1";
@@ -5670,6 +5806,7 @@
   let rarityLookupCache = null;
   let leagueLookupCache = null;
   let nationLookupCache = null;
+  let clubLookupCache = null;
   let positionLookupCache = null;
   let solveButtonStyleInjected = false;
   let solverBridgeReady = false;
@@ -5852,12 +5989,16 @@
       return `${quality[0].toUpperCase()}${quality.slice(1)} ${rarityText}`;
     }).filter(Boolean);
     const toggleLabels = (SOLVER_TOGGLE_FIELDS ?? [])
-      .filter((field) => Boolean(normalized?.[field.key]))
+      .filter((field) =>
+        field.inverted
+          ? !Boolean(normalized?.[field.key])
+          : Boolean(normalized?.[field.key]),
+      )
       .map((field) => {
         if (field.key === "useUnassigned") return "Use unassigned";
         if (field.key === "onlyStorage") return "Only SBC storage";
         if (field.key === "excludeTradable") return "Protect tradables";
-        if (field.key === "excludeSpecial") return "Avoid special cards";
+        if (field.key === "excludeSpecial") return "Allow any special cards";
         if (field.key === "useTotwPlayers") return "Allow TOTW/TOTS";
         if (field.key === "useEvolutionPlayers") return "Allow evolutions";
         if (field.key === "allowConceptPlayers") return "Concept fallback";
@@ -10135,6 +10276,9 @@
 
     const renderSolutions = () => {
       const solutions = multiSolveOverlayState?.solutions ?? [];
+      const enabledSolutions = solutions.filter(
+        (solution) => solution?.enabled !== false,
+      );
       const maxIndex = Math.max(0, solutions.length - 1);
       const clampedIndex = clampInt(
         multiSolveOverlayState?.activeIndex ?? 0,
@@ -10156,6 +10300,7 @@
 
       const active = multiSolveOverlayState.activeIndex ?? 0;
       const sol = solutions[active] ?? null;
+      const solutionEnabled = sol?.enabled !== false;
       const stats = sol?.stats ?? {};
       const requiredPlayers =
         readNumeric(multiSolveOverlayState?.requiredPlayers) ??
@@ -10181,6 +10326,15 @@
       title.textContent = `Solution #${active + 1}`;
       headerLeft.append(title);
 
+      const submitToggle = document.createElement("button");
+      submitToggle.type = "button";
+      submitToggle.className = "ea-data-solution-submit-toggle";
+      submitToggle.setAttribute("data-action", "toggle-solution");
+      submitToggle.setAttribute("role", "switch");
+      submitToggle.setAttribute("aria-checked", String(solutionEnabled));
+      submitToggle.textContent = solutionEnabled ? "Submit On" : "Submit Off";
+      headerLeft.append(submitToggle);
+
       const headerRight = document.createElement("div");
       headerRight.className = "ea-data-preview-header-right";
 
@@ -10188,6 +10342,7 @@
       nav.className = "ea-data-preview-nav";
 
       const isBusy = Boolean(multiSolveOverlayState?.running);
+      submitToggle.disabled = isBusy;
 
       const prevBtn = document.createElement("button");
       prevBtn.type = "button";
@@ -10240,7 +10395,9 @@
       header.append(headerRight);
 
       const cardContainer = document.createElement("div");
-      cardContainer.className = "ea-data-preview-card";
+      cardContainer.className = solutionEnabled
+        ? "ea-data-preview-card"
+        : "ea-data-preview-card is-submit-disabled";
       cardContainer.append(header);
 
       const meta = document.createElement("div");
@@ -10267,9 +10424,7 @@
 
       for (const data of rows) {
         const playerId = data.playerId ?? null;
-        const rating = data.rating ?? "?";
         const name = data.name ?? "Unknown";
-        const rarity = data.rarity ?? "";
         const qualityLabel = data.qualityLabel ?? "";
         const isSpecial = Boolean(data.isSpecial);
         const chemVal = data.chemVal;
@@ -10289,24 +10444,7 @@
         const main = document.createElement("div");
         main.className = "ea-data-preview-main";
 
-        const left = document.createElement("div");
-        left.className = "ea-data-preview-left";
-
-        const ratingEl = document.createElement("div");
-        ratingEl.className = "ea-data-preview-rating";
-        ratingEl.textContent = String(rating);
-
-        const nameEl = document.createElement("div");
-        nameEl.className = "ea-data-preview-name";
-        nameEl.textContent = String(name);
-
-        const rarityEl = document.createElement("div");
-        rarityEl.className = "ea-data-preview-rarity";
-        rarityEl.textContent = rarity ? String(rarity) : "";
-
-        left.append(ratingEl);
-        left.append(nameEl);
-        if (rarity) left.append(rarityEl);
+        const left = createPreviewPlayerIdentity(data);
 
         const right = document.createElement("div");
         right.className = "ea-data-preview-right";
@@ -10314,7 +10452,7 @@
         const idEl = document.createElement("div");
         idEl.className = "ea-data-preview-id";
         idEl.textContent = qualityLabel;
-        if (idEl.textContent) right.append(idEl);
+        if (idEl.textContent && !isSpecial) right.append(idEl);
 
         if (isSpecial) {
           const pill = document.createElement("span");
@@ -10339,10 +10477,27 @@
           right.append(pill);
         }
 
+        const swapBtn = document.createElement("button");
+        swapBtn.type = "button";
+        swapBtn.className = "ea-data-preview-swap";
+        swapBtn.setAttribute("data-action", "swap-player");
+        swapBtn.setAttribute("data-player-id", String(playerId ?? ""));
+        if (data.slotIndex != null) {
+          swapBtn.setAttribute("data-slot-index", String(data.slotIndex));
+        }
+        swapBtn.textContent = "Swap";
+        swapBtn.disabled = isBusy || playerId == null;
+        swapBtn.setAttribute(
+          "aria-label",
+          `Find a replacement for ${String(name)}`,
+        );
+        right.append(swapBtn);
+
         main.append(left);
         main.append(right);
 
         row.append(posEl);
+        row.append(createPreviewPlayerImage(data));
         row.append(main);
         playersWrap.append(row);
       }
@@ -10357,7 +10512,7 @@
         let usedPlayers = 0;
         let usedSpecial = 0;
         const allRows = [];
-        for (const s of solutions) {
+        for (const s of enabledSolutions) {
           const ids = Array.isArray(s?.solutionIds) ? s.solutionIds : [];
           const rowsForSolution = buildPreviewRows({
             solutionIds: ids,
@@ -10394,7 +10549,7 @@
 
         const solPill = document.createElement("span");
         solPill.className = "ea-data-pill";
-        solPill.textContent = `Solutions ${solutions.length}`;
+        solPill.textContent = `Enabled ${enabledSolutions.length}/${solutions.length}`;
         topRight.append(solPill);
 
         const playersPill = document.createElement("span");
@@ -10455,6 +10610,158 @@
         summary.append(pills);
         listEl.append(summary);
       } catch {}
+
+      if (!isBusy) startBtn.disabled = enabledSolutions.length === 0;
+    };
+
+    const swapSolutionPlayer = async ({ playerId, slotIndex } = {}) => {
+      if (multiSolveOverlayState?.running || playerId == null) return;
+      const context = multiSolveOverlayState?.solveContext ?? null;
+      const solutions = multiSolveOverlayState?.solutions ?? [];
+      const active = clampInt(
+        multiSolveOverlayState?.activeIndex ?? 0,
+        0,
+        Math.max(0, solutions.length - 1),
+      );
+      const current = active == null ? null : solutions[active];
+      if (!context || !current) return;
+
+      const slotSolution = current?.slotSolution ?? null;
+      const fieldSlotIndices = Array.isArray(slotSolution?.fieldSlotIndices)
+        ? slotSolution.fieldSlotIndices
+        : [];
+      const fieldPlayerIds = Array.isArray(slotSolution?.fieldSlotToPlayerId)
+        ? slotSolution.fieldSlotToPlayerId
+        : current?.solutionIds ?? [];
+      const selectedId = String(playerId);
+      const selectedSlot = readNumeric(slotIndex);
+      const playerById = multiSolveOverlayState?.playerById ?? new Map();
+      const playerForSlot = new Map();
+      for (let i = 0; i < fieldPlayerIds.length; i += 1) {
+        const mappedSlot = readNumeric(fieldSlotIndices[i]);
+        if (mappedSlot == null) continue;
+        playerForSlot.set(mappedSlot, fieldPlayerIds[i]);
+      }
+
+      const lockedSlots = (context?.payload?.squadSlots ?? []).map((slot) => {
+        const mappedSlot = readNumeric(slot?.slotIndex ?? slot?.index);
+        const mappedPlayerId =
+          mappedSlot == null ? null : playerForSlot.get(mappedSlot);
+        const isSelected =
+          mappedPlayerId != null &&
+          String(mappedPlayerId) === selectedId &&
+          (selectedSlot == null || mappedSlot === selectedSlot);
+        if (isSelected) {
+          return {
+            ...slot,
+            item: null,
+            isValid: false,
+            isLocked: false,
+            isEditable: true,
+            isBrick: false,
+          };
+        }
+        if (mappedPlayerId == null) return { ...slot };
+        const item =
+          playerById.get(String(mappedPlayerId)) ??
+          playerById.get(mappedPlayerId) ??
+          null;
+        return {
+          ...slot,
+          item,
+          isValid: Boolean(item),
+          isLocked: Boolean(item),
+          isEditable: !item,
+        };
+      });
+
+      const excluded = new Set(
+        (context?.filters?.excludedPlayerIds ?? []).map(String),
+      );
+      excluded.add(selectedId);
+      for (let i = 0; i < solutions.length; i += 1) {
+        if (i === active) continue;
+        for (const id of solutions[i]?.solutionIds ?? []) excluded.add(String(id));
+      }
+
+      setRunning(true, { mode: "swapping" });
+      setStatus("Finding a valid replacement...");
+      try {
+        const result = await solveWithConceptFallback({
+          payload: context.payload,
+          players: context.players,
+          requirements: context.requirements,
+          requirementsNormalized: context.requirementsNormalized,
+          requiredPlayers: context.requiredPlayers,
+          squadSlots: lockedSlots,
+          prioritize: context.prioritize,
+          filters: {
+            ...context.filters,
+            preserveOccupiedSlots: true,
+            excludedPlayerIds: Array.from(excluded),
+          },
+          debug: debugEnabled,
+          playerById,
+          label: "multi-swap",
+        });
+        if (
+          !result?.solutions?.length ||
+          result?.requiresConcepts ||
+          result?.stats?.requiresConcepts
+        ) {
+          showToast({
+            type: "info",
+            title: "No Valid Swap",
+            message: "No replacement keeps the other ten players and satisfies this SBC.",
+            timeoutMs: 7000,
+          });
+          return;
+        }
+
+        const solutionIds = result.solutions[0];
+        const nextSlotSolution = result?.solutionSlots?.[0] ?? null;
+        const specialCount = solutionIds.reduce(
+          (count, id) =>
+            count + (playerById.get(String(id))?.isSpecial ? 1 : 0),
+          0,
+        );
+        solutions[active] = {
+          solutionIds,
+          slotSolution: nextSlotSolution,
+          stats: result?.stats ?? null,
+          specialCount,
+          enabled: current?.enabled !== false,
+        };
+        multiSolveOverlayState.solutions = solutions;
+        renderSolutions();
+        await fetchPricesForPreviewRows(
+          buildRowsForSolvedSolution({
+            solutionIds,
+            slotSolution: nextSlotSolution,
+            playerById,
+            slotIndexToPositionName:
+              multiSolveOverlayState?.slotIndexToPositionName ?? null,
+          }),
+          { onLoading: renderSolutions },
+        );
+        setStatus(`Solution ${active + 1} updated.`);
+        showToast({
+          type: "success",
+          title: "Player Swapped",
+          message: "The replacement was validated by the solver.",
+          timeoutMs: 3500,
+        });
+      } catch (error) {
+        log("debug", "[EA Data] Multi solve player swap failed", error);
+        showToast({
+          type: "error",
+          title: "Swap Failed",
+          message: error?.message || "Unable to find a replacement.",
+          timeoutMs: 7000,
+        });
+      } finally {
+        setRunning(false);
+      }
     };
 
     listEl?.addEventListener("click", (event) => {
@@ -10473,6 +10780,16 @@
       } else if (action === "next") {
         multiSolveOverlayState.activeIndex = Math.min(maxIndex, active + 1);
         renderSolutions();
+      } else if (action === "toggle-solution") {
+        if (solutions[active]) {
+          solutions[active].enabled = solutions[active]?.enabled === false;
+          renderSolutions();
+        }
+      } else if (action === "swap-player") {
+        void swapSolutionPlayer({
+          playerId: btn.getAttribute("data-player-id"),
+          slotIndex: btn.getAttribute("data-slot-index"),
+        });
       }
     });
 
@@ -10552,7 +10869,11 @@
           stopBtn.classList.add("ea-data-is-hidden");
           stopBtn.disabled = false;
           stopBtn.textContent = "Stop";
-          startBtn.disabled = !(multiSolveOverlayState.solutions?.length > 0);
+          startBtn.disabled = !(
+            multiSolveOverlayState.solutions?.some?.(
+              (solution) => solution?.enabled !== false,
+            ) ?? false
+          );
           generateBtn.textContent = "Fetch Solutions";
           startBtn.textContent = "Start Submitting";
         }
@@ -10571,6 +10892,7 @@
       multiSolveOverlayState.requiredPlayers = 11;
       multiSolveOverlayState.playerById = null;
       multiSolveOverlayState.slotIndexToPositionName = null;
+      multiSolveOverlayState.solveContext = null;
       multiSolveOverlayState.abortRequested = false;
       setRunning(false);
       setStatus("");
@@ -10897,6 +11219,15 @@
           multiSolveOverlayState.slotIndexToPositionName =
             slotIndexToPositionName;
           multiSolveOverlayState.activeIndex = 0;
+          multiSolveOverlayState.solveContext = {
+            payload,
+            players: filteredPlayers,
+            requirements: safeRequirements,
+            requirementsNormalized: safeRequirementsNormalized,
+            requiredPlayers: payload.requiredPlayers ?? null,
+            prioritize: payload.prioritize,
+            filters: mergedFilters,
+          };
         } catch {}
 
         const used = new Set(
@@ -10977,6 +11308,7 @@
             slotSolution,
             stats: result?.stats ?? null,
             specialCount,
+            enabled: true,
           });
           multiSolveOverlayState.solutions = solutions;
           setProgress(i + 1, times);
@@ -11039,7 +11371,9 @@
       if (multiSolveOverlayState?.running) return;
       const startedChallengeId = currentChallenge?.id ?? null;
       if (startedChallengeId == null) return;
-      const solutions = multiSolveOverlayState?.solutions ?? [];
+      const solutions = (multiSolveOverlayState?.solutions ?? []).filter(
+        (solution) => solution?.enabled !== false,
+      );
       if (!solutions.length) return;
       if (!isRepeatableChallenge(currentChallenge)) {
         showToast({
@@ -11089,10 +11423,6 @@
               preserveExistingValid: false,
             },
           );
-          if (!(await delayAbortable(jitterMs(350, 0.35), shouldAbort))) {
-            multiSolveOverlayState.abortRequested = true;
-            break;
-          }
           refreshOpenChallengeUI(challengeEntity);
 
           setStatus(`(${i + 1}/${solutions.length}) Submitting...`);
@@ -11121,23 +11451,18 @@
             timeoutMs: 3500,
           });
 
-          setStatus(`(${i + 1}/${solutions.length}) Cooling down...`);
-          if (!(await delayAbortable(jitterMs(4500, 0.35), shouldAbort))) {
-            multiSolveOverlayState.abortRequested = true;
-            break;
-          }
           try {
+            setStatus(`(${i + 1}/${solutions.length}) Refreshing...`);
             await sbcApiCall(
               "requestChallengesForSet",
               () =>
                 observableToPromise(
                   services.SBC.requestChallengesForSet(setEntity),
                 ),
-              { minGapMs: SBC_AUTOMATION_MIN_GAP_MS, maxAttempts: 2 },
+              { minGapMs: SBC_QUEUE_REFRESH_MIN_GAP_MS, maxAttempts: 2 },
             );
           } catch {}
           try {
-            setStatus(`(${i + 1}/${solutions.length}) Refreshing...`);
             await loadChallenge(challengeEntity, true, { force: true });
           } catch {}
           refreshOpenChallengeUI(challengeEntity);
@@ -11262,6 +11587,7 @@
       requiredPlayers: 11,
       playerById: null,
       slotIndexToPositionName: null,
+      solveContext: null,
       sortKey: "rating_desc",
       running: false,
       mode: "idle",
@@ -12527,38 +12853,60 @@
         label.textContent = name;
         label.title = name;
 
+        const submitState = document.createElement("span");
+        submitState.className = "ea-data-challenge-card__submit-state";
+        submitState.textContent = isSelected ? "Submit On" : "Submit Off";
+
+        card.setAttribute("role", "switch");
+        card.setAttribute("aria-checked", String(isSelected));
+
         card.append(img);
         card.append(label);
+        card.append(submitState);
 
         card.addEventListener("click", () => {
           if (setSolveOverlayState?.running) return;
-          const currentIds = setSolveOverlayState.selectedChallengeIds;
-          let newIds;
-          if (currentIds == null) {
-            newIds = new Set(challenges.map((c) => String(c.id)));
-            newIds.delete(chIdStr);
-          } else {
-            newIds = new Set(currentIds);
-            if (newIds.has(chIdStr)) {
-              newIds.delete(chIdStr);
-            } else {
-              newIds.add(chIdStr);
-            }
-          }
-          if (newIds.size === challenges.length) {
-            setSolveOverlayState.selectedChallengeIds = null;
-          } else if (newIds.size === 0) {
-            setSolveOverlayState.selectedChallengeIds = new Set();
-          } else {
-            setSolveOverlayState.selectedChallengeIds = newIds;
-          }
+          toggleSetChallengeSubmission(chIdStr);
           renderChallengePicker();
+          renderEntries();
           syncSetCycleControls();
         });
 
         challengePickerWrap.append(card);
       }
       renderSetSolveRightPanel({ reason: "picker-ready" });
+    };
+
+    const toggleSetChallengeSubmission = (challengeId) => {
+      const challenges = Array.isArray(setSolveOverlayState?.availableChallenges)
+        ? setSolveOverlayState.availableChallenges
+        : [];
+      const challengeKey = String(challengeId);
+      const currentIds = setSolveOverlayState?.selectedChallengeIds;
+      const nextIds =
+        currentIds == null
+          ? new Set(challenges.map((challenge) => String(challenge?.id)))
+          : new Set(currentIds);
+      if (nextIds.has(challengeKey)) nextIds.delete(challengeKey);
+      else nextIds.add(challengeKey);
+      setSolveOverlayState.selectedChallengeIds =
+        nextIds.size === challenges.length ? null : nextIds;
+    };
+
+    const createSetEntrySubmitToggle = (entry) => {
+      const challengeId = String(entry?.challengeId ?? "");
+      const selectedIds = setSolveOverlayState?.selectedChallengeIds;
+      const enabled = selectedIds == null || selectedIds.has(challengeId);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ea-data-solution-submit-toggle";
+      button.setAttribute("data-action", "toggle-set-entry");
+      button.setAttribute("data-challenge-id", challengeId);
+      button.setAttribute("role", "switch");
+      button.setAttribute("aria-checked", String(enabled));
+      button.textContent = enabled ? "Submit On" : "Submit Off";
+      button.disabled = Boolean(setSolveOverlayState?.running);
+      return button;
     };
 
     const renderEntries = () => {
@@ -12691,24 +13039,7 @@
 
             const main = document.createElement("div");
             main.className = "ea-data-preview-main";
-            const left = document.createElement("div");
-            left.className = "ea-data-preview-left";
-
-            const ratingEl = document.createElement("div");
-            ratingEl.className = "ea-data-preview-rating";
-            ratingEl.textContent = String(rowData.rating ?? "?");
-
-            const nameEl = document.createElement("div");
-            nameEl.className = "ea-data-preview-name";
-            nameEl.textContent = String(rowData.name ?? "Unknown");
-
-            const rarityEl = document.createElement("div");
-            rarityEl.className = "ea-data-preview-rarity";
-            rarityEl.textContent = rowData.rarity ? String(rowData.rarity) : "";
-
-            left.append(ratingEl);
-            left.append(nameEl);
-            if (rowData.rarity) left.append(rarityEl);
+            const left = createPreviewPlayerIdentity(rowData);
 
             const right = document.createElement("div");
             right.className = "ea-data-preview-right";
@@ -12716,7 +13047,7 @@
             const idEl = document.createElement("div");
             idEl.className = "ea-data-preview-id";
             idEl.textContent = rowData.qualityLabel ?? "";
-            if (idEl.textContent) right.append(idEl);
+            if (idEl.textContent && !rowData.isSpecial) right.append(idEl);
 
             if (rowData.isSpecial) {
               const pill = document.createElement("span");
@@ -12740,9 +13071,23 @@
               right.append(pill);
             }
 
+            const swapBtn = document.createElement("button");
+            swapBtn.type = "button";
+            swapBtn.className = "ea-data-preview-swap";
+            swapBtn.setAttribute("data-action", "swap-set-player");
+            swapBtn.setAttribute("data-challenge-id", String(entry?.challengeId ?? ""));
+            swapBtn.setAttribute("data-player-id", String(rowData.playerId ?? ""));
+            if (rowData.slotIndex != null) {
+              swapBtn.setAttribute("data-slot-index", String(rowData.slotIndex));
+            }
+            swapBtn.textContent = "Swap";
+            swapBtn.disabled = isBusy || rowData.playerId == null;
+            right.append(swapBtn);
+
             main.append(left);
             main.append(right);
             row.append(posEl);
+            row.append(createPreviewPlayerImage(rowData));
             row.append(main);
             playersWrap.append(row);
           }
@@ -12838,6 +13183,7 @@
             leftWrap.append(arrowIcon);
             leftWrap.append(challengeTitle);
             summaryEl.append(leftWrap);
+            summaryEl.append(createSetEntrySubmitToggle(entry));
 
             const statusMeta = document.createElement("div");
             statusMeta.className = "ea-data-preview-meta";
@@ -13019,6 +13365,7 @@
       title.textContent =
         entry?.challengeName ?? `Challenge ${entry?.challengeId ?? "?"}`;
       headerLeft.append(title);
+      headerLeft.append(createSetEntrySubmitToggle(entry));
 
       const headerRight = document.createElement("div");
       headerRight.className = "ea-data-preview-header-right";
@@ -13186,8 +13533,13 @@
             rarity,
             qualityLabel,
             definitionId,
+            imageCandidates: getPlayerImageCandidates(player),
             priceLookupId,
             isSpecial,
+            preferredPositionName:
+              sanitizeDisplayText(player?.preferredPositionName) ?? posLabel,
+            clubName: resolveEntityClubName(player),
+            nationName: resolveEntityNationName(player),
             chemVal,
             onPosVal,
             priceMeta: readCachedPlayerPrice(priceLookupId),
@@ -13222,24 +13574,7 @@
 
           const main = document.createElement("div");
           main.className = "ea-data-preview-main";
-          const left = document.createElement("div");
-          left.className = "ea-data-preview-left";
-
-          const ratingEl = document.createElement("div");
-          ratingEl.className = "ea-data-preview-rating";
-          ratingEl.textContent = String(rowData.rating ?? "?");
-
-          const nameEl = document.createElement("div");
-          nameEl.className = "ea-data-preview-name";
-          nameEl.textContent = String(rowData.name ?? "Unknown");
-
-          const rarityEl = document.createElement("div");
-          rarityEl.className = "ea-data-preview-rarity";
-          rarityEl.textContent = rowData.rarity ? String(rowData.rarity) : "";
-
-          left.append(ratingEl);
-          left.append(nameEl);
-          if (rowData.rarity) left.append(rarityEl);
+          const left = createPreviewPlayerIdentity(rowData);
 
           const right = document.createElement("div");
           right.className = "ea-data-preview-right";
@@ -13247,7 +13582,7 @@
           const idEl = document.createElement("div");
           idEl.className = "ea-data-preview-id";
           idEl.textContent = rowData.qualityLabel ?? "";
-          if (idEl.textContent) right.append(idEl);
+          if (idEl.textContent && !rowData.isSpecial) right.append(idEl);
 
           if (rowData.isSpecial) {
             const pill = document.createElement("span");
@@ -13271,9 +13606,23 @@
             right.append(pill);
           }
 
+          const swapBtn = document.createElement("button");
+          swapBtn.type = "button";
+          swapBtn.className = "ea-data-preview-swap";
+          swapBtn.setAttribute("data-action", "swap-set-player");
+          swapBtn.setAttribute("data-challenge-id", String(entry?.challengeId ?? ""));
+          swapBtn.setAttribute("data-player-id", String(rowData.playerId ?? ""));
+          if (rowData.slotIndex != null) {
+            swapBtn.setAttribute("data-slot-index", String(rowData.slotIndex));
+          }
+          swapBtn.textContent = "Swap";
+          swapBtn.disabled = isBusy || rowData.playerId == null;
+          right.append(swapBtn);
+
           main.append(left);
           main.append(right);
           row.append(posEl);
+          row.append(createPreviewPlayerImage(rowData));
           row.append(main);
           playersWrap.append(row);
         }
@@ -13421,12 +13770,163 @@
       renderSetSolveRightPanel({ reason: "entries-single" });
     };
 
+    const swapSetSolutionPlayer = async ({ challengeId, playerId, slotIndex } = {}) => {
+      if (setSolveOverlayState?.running || playerId == null) return;
+      const cycleResults = Array.isArray(setSolveOverlayState?.cycleResults)
+        ? setSolveOverlayState.cycleResults
+        : [];
+      const activeCycle = setSolveOverlayState?.multiSetEnabled
+        ? cycleResults[setSolveOverlayState?.activeIndex ?? 0]
+        : null;
+      const entries = activeCycle?.entries ?? setSolveOverlayState?.entries ?? [];
+      const entry = entries.find(
+        (candidate) => String(candidate?.challengeId) === String(challengeId),
+      );
+      const context = entry?.solveContext ?? null;
+      if (!entry || !context) {
+        showToast({
+          type: "info",
+          title: "Fetch Solutions Again",
+          message: "This squad was created before player swapping was enabled.",
+          timeoutMs: 5000,
+        });
+        return;
+      }
+
+      const slotSolution = entry?.slotSolution ?? null;
+      const fieldSlotIndices = Array.isArray(slotSolution?.fieldSlotIndices)
+        ? slotSolution.fieldSlotIndices
+        : [];
+      const fieldPlayerIds = Array.isArray(slotSolution?.fieldSlotToPlayerId)
+        ? slotSolution.fieldSlotToPlayerId
+        : entry?.solutionIds ?? [];
+      const selectedId = String(playerId);
+      const selectedSlot = readNumeric(slotIndex);
+      const playerById = setSolveOverlayState?.playerById ?? new Map();
+      const playerForSlot = new Map();
+      for (let i = 0; i < fieldPlayerIds.length; i += 1) {
+        const mappedSlot = readNumeric(fieldSlotIndices[i]);
+        if (mappedSlot != null) playerForSlot.set(mappedSlot, fieldPlayerIds[i]);
+      }
+
+      const lockedSlots = (context?.squadSlots ?? []).map((slot) => {
+        const mappedSlot = readNumeric(slot?.slotIndex ?? slot?.index);
+        const mappedPlayerId =
+          mappedSlot == null ? null : playerForSlot.get(mappedSlot);
+        const isSelected =
+          mappedPlayerId != null &&
+          String(mappedPlayerId) === selectedId &&
+          (selectedSlot == null || mappedSlot === selectedSlot);
+        if (isSelected) {
+          return {
+            ...slot,
+            item: null,
+            isValid: false,
+            isLocked: false,
+            isEditable: true,
+            isBrick: false,
+          };
+        }
+        if (mappedPlayerId == null) return { ...slot };
+        const item = playerById.get(String(mappedPlayerId)) ?? null;
+        return {
+          ...slot,
+          item,
+          isValid: Boolean(item),
+          isLocked: Boolean(item),
+          isEditable: !item,
+        };
+      });
+
+      const excluded = new Set(
+        (context?.filters?.excludedPlayerIds ?? []).map(String),
+      );
+      excluded.add(selectedId);
+      const siblingEntries = activeCycle
+        ? cycleResults.flatMap((cycle) => cycle?.entries ?? [])
+        : entries;
+      for (const sibling of siblingEntries) {
+        if (sibling === entry) continue;
+        for (const id of sibling?.solutionIds ?? []) excluded.add(String(id));
+      }
+
+      setRunning(true, { mode: "swapping" });
+      setStatus(`Finding a replacement for ${entry?.challengeName ?? "squad"}...`);
+      try {
+        const result = await solveWithConceptFallback({
+          payload: context.payload,
+          players: context.players,
+          requirements: context.requirements,
+          requirementsNormalized: context.requirementsNormalized,
+          requiredPlayers: context.requiredPlayers,
+          squadSlots: lockedSlots,
+          prioritize: context.prioritize,
+          filters: {
+            ...context.filters,
+            preserveOccupiedSlots: true,
+            excludedPlayerIds: Array.from(excluded),
+          },
+          debug: debugEnabled,
+          playerById,
+          label: "set-swap",
+        });
+        if (!result?.solutions?.length || result?.requiresConcepts) {
+          throw new Error("No replacement keeps the other ten players valid.");
+        }
+        entry.solutionIds = result.solutions[0];
+        entry.slotSolution = result?.solutionSlots?.[0] ?? null;
+        entry.stats = result?.stats ?? null;
+        entry.specialCount = entry.solutionIds.reduce(
+          (count, id) => count + (playerById.get(String(id))?.isSpecial ? 1 : 0),
+          0,
+        );
+        renderEntries();
+        await fetchPricesForPreviewRows(
+          buildRowsForSolvedSolution({
+            solutionIds: entry.solutionIds,
+            slotSolution: entry.slotSolution,
+            playerById,
+            slotIndexToPositionName: entry.slotIndexToPositionName,
+          }),
+          { onLoading: renderEntries },
+        );
+        setStatus(`${entry?.challengeName ?? "Squad"} updated.`);
+      } catch (error) {
+        showToast({
+          type: "error",
+          title: "Swap Failed",
+          message: error?.message || "Unable to find a replacement.",
+          timeoutMs: 6000,
+        });
+      } finally {
+        setRunning(false);
+        renderEntries();
+      }
+    };
+
     listEl?.addEventListener("click", (event) => {
       if (setSolveOverlayState?.running) return;
       const target = event?.target ?? null;
       const btn = target?.closest?.("button[data-action]") ?? null;
       if (!btn) return;
       const action = btn.getAttribute("data-action");
+      if (action === "toggle-set-entry") {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSetChallengeSubmission(btn.getAttribute("data-challenge-id"));
+        renderChallengePicker();
+        renderEntries();
+        syncSetCycleControls();
+        return;
+      }
+      if (action === "swap-set-player") {
+        void swapSetSolutionPlayer({
+          challengeId: btn.getAttribute("data-challenge-id"),
+          playerId: btn.getAttribute("data-player-id"),
+          slotIndex: btn.getAttribute("data-slot-index"),
+        });
+        return;
+      }
       if (action !== "prev" && action !== "next") return;
 
       const entries = Array.isArray(setSolveOverlayState?.entries)
@@ -13576,8 +14076,13 @@
       const entries = Array.isArray(setSolveOverlayState?.entries)
         ? setSolveOverlayState.entries
         : [];
+      const selectedChallengeIds = setSolveOverlayState?.selectedChallengeIds;
+      const isEntrySelected = (entry) =>
+        selectedChallengeIds == null ||
+        selectedChallengeIds.has(String(entry?.challengeId));
       const singleSolvedEntries = entries.filter(
         (entry) =>
+          isEntrySelected(entry) &&
           entry?.status === "solved" &&
           Array.isArray(entry?.solutionIds) &&
           entry.solutionIds.length > 0,
@@ -13592,7 +14097,8 @@
           const cycleEntries = Array.isArray(cycle?.entries)
             ? cycle.entries
             : [];
-          return cycleEntries.every(
+          const selectedEntries = cycleEntries.filter(isEntrySelected);
+          return selectedEntries.length > 0 && selectedEntries.every(
             (entry) =>
               entry?.status === "solved" &&
               Array.isArray(entry?.solutionIds) &&
@@ -13600,7 +14106,7 @@
           );
         });
         const singleCycleEntries = Array.isArray(firstSolvedCycle?.entries)
-          ? firstSolvedCycle.entries
+          ? firstSolvedCycle.entries.filter(isEntrySelected)
           : singleSolvedEntries;
         return {
           entries: singleCycleEntries,
@@ -13647,7 +14153,7 @@
       for (const cycle of selectedCycles) {
         const cycleEntries = Array.isArray(cycle?.entries) ? cycle.entries : [];
         for (const entry of cycleEntries) {
-          flattenedEntries.push(entry);
+          if (isEntrySelected(entry)) flattenedEntries.push(entry);
         }
       }
       return {
@@ -13810,6 +14316,10 @@
       } catch {}
       updateSetCycleMeta();
       renderSetSolveRightPanel({ reason: "cycle-controls" });
+      if (!setSolveOverlayState?.running) {
+        startBtn.disabled =
+          (getSubmittableEntriesForCurrentMode()?.totalEntries ?? 0) <= 0;
+      }
     };
 
     const syncSetCycleRepeatability = (
@@ -14477,6 +14987,16 @@
                 specialCount,
                 stats: result?.stats ?? null,
                 submitState: null,
+                solveContext: {
+                  payload,
+                  players: filteredPlayers,
+                  requirements: safeRequirements,
+                  requirementsNormalized: safeRequirementsNormalized,
+                  requiredPlayers: slotInfo.requiredPlayers ?? null,
+                  squadSlots: slotInfo.squadSlots,
+                  prioritize: payload?.prioritize,
+                  filters: mergedFilters,
+                },
               };
               entries.push(entry);
               setSolveOverlayState.entries = entries;
@@ -14793,6 +15313,16 @@
               specialCount,
               stats: result?.stats ?? null,
               submitState: null,
+              solveContext: {
+                payload,
+                players: filteredPlayers,
+                requirements: safeRequirements,
+                requirementsNormalized: safeRequirementsNormalized,
+                requiredPlayers: slotInfo.requiredPlayers ?? null,
+                squadSlots: slotInfo.squadSlots,
+                prioritize: payload?.prioritize,
+                filters: mergedFilters,
+              },
             };
             cycleEntries.push(entry);
             setStatus(
@@ -15058,11 +15588,32 @@
                 ? `(Cycle ${batch.cycleIndex}) (${i + 1}/${batchEntries.length}) Loading ${challengeName}...`
                 : `(${i + 1}/${batchEntries.length}) Loading ${challengeName}...`,
             );
-            const challengeEntity = await getChallengeEntityForSubmission(
-              startedSetId,
-              entry?.challengeId,
-              entry?.challengeName ?? null,
-            );
+            const cachedChallenges = Array.isArray(setEntity?.getChallenges?.())
+              ? setEntity.getChallenges()
+              : [];
+            const isOpenChallenge = (challenge) => {
+              try {
+                return !challenge?.isCompleted?.();
+              } catch {
+                return true;
+              }
+            };
+            const challengeEntity =
+              cachedChallenges.find(
+                (challenge) =>
+                  String(challenge?.id) === String(entry?.challengeId) &&
+                  isOpenChallenge(challenge),
+              ) ??
+              cachedChallenges.find(
+                (challenge) =>
+                  (challenge?.name ?? challenge?.title) === entry?.challengeName &&
+                  isOpenChallenge(challenge),
+              ) ??
+              (await getChallengeEntityForSubmission(
+                startedSetId,
+                entry?.challengeId,
+                entry?.challengeName ?? null,
+              ));
             if (!challengeEntity) {
               console.warn(
                 `[EA Data] startSubmitting skipped ${challengeName} because challenge entity was not found after server refresh`,
@@ -15093,15 +15644,6 @@
                   preHydratedChallenge: true,
                 },
               );
-              if (
-                !(await delayAbortable(jitterMs(350, 0.35), () =>
-                  Boolean(setSolveOverlayState.abortRequested),
-                ))
-              ) {
-                setSolveOverlayState.abortRequested = true;
-                break;
-              }
-
               setStatus(
                 multiSetEnabled
                   ? `(Cycle ${batch.cycleIndex}) (${i + 1}/${batchEntries.length}) Submitting ${challengeName}...`
@@ -15137,25 +15679,6 @@
                 timeoutMs: 4000,
               });
 
-              setStatus(
-                multiSetEnabled
-                  ? `(Cycle ${batch.cycleIndex}) (${i + 1}/${batchEntries.length}) Cooling down...`
-                  : `(${i + 1}/${batchEntries.length}) Cooling down...`,
-              );
-              if (!(await delayAbortable(jitterMs(4500, 0.35), shouldAbort))) {
-                setSolveOverlayState.abortRequested = true;
-                break;
-              }
-              try {
-                await sbcApiCall(
-                  "requestChallengesForSet",
-                  () =>
-                    observableToPromise(
-                      services.SBC.requestChallengesForSet(setEntity),
-                    ),
-                  { minGapMs: SBC_AUTOMATION_MIN_GAP_MS, maxAttempts: 2 },
-                );
-              } catch {}
             } catch (challengeError) {
               log(
                 "debug",
@@ -15289,14 +15812,6 @@
                       preHydratedChallenge: true,
                     },
                   );
-                  if (
-                    !(await delayAbortable(jitterMs(350, 0.35), () =>
-                      Boolean(setSolveOverlayState.abortRequested),
-                    ))
-                  ) {
-                    setSolveOverlayState.abortRequested = true;
-                    break;
-                  }
                   setStatus(
                     multiSetEnabled
                       ? `(Cycle ${batch.cycleIndex}) (${i + 1}/${batchEntries.length}) Submitting ${challengeName} (retry)...`
@@ -15323,27 +15838,6 @@
                     message: `${challengeName} re-solved and submitted successfully.`,
                     timeoutMs: 5000,
                   });
-                  setStatus(
-                    multiSetEnabled
-                      ? `(Cycle ${batch.cycleIndex}) (${i + 1}/${batchEntries.length}) Cooling down...`
-                      : `(${i + 1}/${batchEntries.length}) Cooling down...`,
-                  );
-                  if (
-                    !(await delayAbortable(jitterMs(4500, 0.35), shouldAbort))
-                  ) {
-                    setSolveOverlayState.abortRequested = true;
-                    break;
-                  }
-                  try {
-                    await sbcApiCall(
-                      "requestChallengesForSet",
-                      () =>
-                        observableToPromise(
-                          services.SBC.requestChallengesForSet(setEntity),
-                        ),
-                      { minGapMs: SBC_AUTOMATION_MIN_GAP_MS, maxAttempts: 2 },
-                    );
-                  } catch {}
                   continue;
                 } catch (retryError) {
                   log("debug", "[EA Data] Smart re-solve failed", retryError);
@@ -15420,22 +15914,6 @@
             }
           }
 
-          // Allow the EA backend time to process the repeat reset before
-          // fetching challenges for the next cycle.
-          if (
-            multiSetEnabled &&
-            c < cycleBatches.length - 1 &&
-            !setSolveOverlayState.abortRequested
-          ) {
-            if (
-              !(await delayAbortable(jitterMs(2000, 0.3), () =>
-                Boolean(setSolveOverlayState.abortRequested),
-              ))
-            ) {
-              setSolveOverlayState.abortRequested = true;
-              break;
-            }
-          }
         }
 
         if (setSolveOverlayState.abortRequested) {
@@ -17911,9 +18389,10 @@
                 const toggleId = `ea-data-sequence-${escapeHtml(
                   normalizedStep?.id,
                 )}-${escapeHtml(field?.key)}`;
-                const checked = Boolean(
+                const storedValue = Boolean(
                   normalizedStep?.settingsSnapshot?.[field?.key],
                 );
+                const checked = field?.inverted ? !storedValue : storedValue;
                 return `
                   <label class="ea-data-sequence-toggle-row" data-checked="${checked ? "true" : "false"}" data-disabled="${isRunning ? "true" : "false"}" for="${toggleId}">
                     <span class="ea-data-sequence-toggle-copy">
@@ -20675,10 +21154,15 @@
       const field = target.getAttribute("data-step-field");
       const toggleKey = target.getAttribute("data-step-toggle");
       if (toggleKey) {
+        const toggleField = SOLVER_TOGGLE_FIELDS.find(
+          (entry) => entry?.key === toggleKey,
+        );
         step.settingsSnapshot = normalizeSolverSettingsInput(
           {
             ...step.settingsSnapshot,
-            [toggleKey]: Boolean(target.checked),
+            [toggleKey]: toggleField?.inverted
+              ? !Boolean(target.checked)
+              : Boolean(target.checked),
           },
           sequenceSolveOverlayState?.defaultSettings ??
             getDefaultSolverSettings(),
@@ -22994,8 +23478,9 @@
       key: "excludeSpecial",
       path: SETTINGS_PATHS.SOLVER_EXCLUDE_SPECIAL,
       idSuffix: "exclude-special",
-      label: "Exclude Special",
-      help: "Avoid using special cards except TOTW, TOTS, and inform items. Those are controlled separately.",
+      label: "Any Special Cards",
+      help: "Allow any special or promotional card that falls within the selected rating range.",
+      inverted: true,
       scopes: Object.freeze(["challenge", "global", "multi", "set"]),
       legacyKeys: Object.freeze([]),
     }),
@@ -23121,7 +23606,9 @@
       const snapshot = {};
       for (const { field, input } of controls) {
         if (!field) continue;
-        snapshot[field.key] = Boolean(input?.checked);
+        snapshot[field.key] = field.inverted
+          ? !Boolean(input?.checked)
+          : Boolean(input?.checked);
       }
       return snapshot;
     };
@@ -23133,7 +23620,9 @@
       for (const { field, input } of controls) {
         if (!field || !input) continue;
         try {
-          input.checked = Boolean(normalized[field.key]);
+          input.checked = field.inverted
+            ? !Boolean(normalized[field.key])
+            : Boolean(normalized[field.key]);
         } catch {}
       }
       return normalized;
@@ -25014,9 +25503,15 @@
       if (!useEvolutionPlayers && isEvolutionPlayer(player)) return false;
       const isTotwOrTots = isTotwOrTotsPlayer(player);
       if (!useTotwPlayers && isTotwOrTots) return false;
+      const rating = readNumeric(player?.rating);
+      const isWithinRatingRange =
+        rating != null && rating >= ratingMin && rating <= ratingMax;
       if (useUnassigned && (player?.isDuplicate || player?.isUnassigned)) {
         const bucket = getBaseCardBucket(player);
-        return !bucket || allowedCardBucketSet.has(bucket);
+        return (
+          isWithinRatingRange &&
+          (!bucket || allowedCardBucketSet.has(bucket))
+        );
       }
       if (onlyStorage && !isOnlyStorageEligible(player)) return false;
       if (excludeTradable && Boolean(player?.isTradeable)) return false;
@@ -25024,8 +25519,7 @@
         return false;
       const bucket = getBaseCardBucket(player);
       if (bucket && !allowedCardBucketSet.has(bucket)) return false;
-      const rating = readNumeric(player?.rating);
-      return rating != null && rating >= ratingMin && rating <= ratingMax;
+      return isWithinRatingRange;
     });
 
     return {
@@ -27871,6 +28365,45 @@
     return options;
   };
 
+  const getClubName = (clubId) => {
+    if (clubId == null) return null;
+    if (!clubLookupCache) {
+      const provider = factories?.DataProvider ?? null;
+      const methods = [
+        "getTeamDP",
+        "getTeamsDP",
+        "getClubDP",
+        "getClubsDP",
+        "getTeamDataProvider",
+        "getClubDataProvider",
+      ];
+      let entries = [];
+      for (const method of methods) {
+        if (typeof provider?.[method] !== "function") continue;
+        try {
+          entries = collectDataProviderEntries(provider[method]());
+        } catch {
+          entries = [];
+        }
+        if (entries.length) break;
+      }
+      clubLookupCache = new Map();
+      for (const club of entries) {
+        const id = club?.id ?? club?.teamId ?? club?.clubId;
+        const name = sanitizeDisplayText(
+          club?.label ??
+            club?.name ??
+            club?.shortName ??
+            club?.displayName ??
+            null,
+        );
+        if (id == null || !name) continue;
+        clubLookupCache.set(String(id), name);
+      }
+    }
+    return clubLookupCache.get(String(clubId)) ?? null;
+  };
+
   const getNationLookup = () => {
     if (nationLookupCache) return nationLookupCache;
     const provider = factories?.DataProvider ?? null;
@@ -30330,9 +30863,24 @@
       !isStorage &&
       !isAcademy &&
       !isEvolution;
+    let imageUrl =
+      item?.imageUrl ??
+      item?.largeImgUrl ??
+      item?.imgUrl ??
+      item?.headshot?.largeImgUrl ??
+      null;
+    for (const method of ["getImageUrl", "getLargeImageUrl", "getPlayerImageUrl"]) {
+      if (imageUrl || typeof item?.[method] !== "function") continue;
+      try {
+        imageUrl = item[method]();
+      } catch {}
+    }
     return {
       id: item.id,
       definitionId: item.definitionId,
+      assetId: item.assetId ?? item._assetId ?? null,
+      resourceId: item.resourceId ?? item._resourceId ?? null,
+      imageUrl: typeof imageUrl === "string" ? imageUrl : null,
       name: resolvePlayerName(item),
       pile: item.pile,
       isTradeable: item.isTradeable?.(),
@@ -30348,6 +30896,7 @@
       nationId: item.nationId,
       nationName: resolveEntityNationName(item),
       teamId: item.teamId,
+      teamName: resolveEntityClubName(item),
       playStyle: item.playStyle,
       owners: item.owners,
       upgrades: item.upgrades,
@@ -30625,34 +31174,262 @@
     animationHooked: false,
     detailHooked: false,
   };
+  let quickOrganizeButton = null;
+
+  const refreshVisibleUnassignedItems = async () => {
+    const current = getCurrentEaController();
+    const queue = [current].filter(Boolean);
+    const seen = new Set();
+    let controller = null;
+    while (queue.length && !controller) {
+      const candidate = queue.shift();
+      if (!candidate || seen.has(candidate)) continue;
+      seen.add(candidate);
+      const name = String(
+        candidate?.className ?? candidate?.constructor?.name ?? "",
+      );
+      if (name.includes("UTUnassigned")) {
+        controller = candidate;
+        break;
+      }
+      queue.push(...Array.from(candidate?.childViewControllers ?? []));
+    }
+    const unassignedRepo =
+      services?.Item?.itemDao?.itemRepo?.unassigned ??
+      repositories?.Item?.unassigned ??
+      null;
+    try {
+      await unassignedRepo?.reset?.();
+    } catch {}
+    if (typeof controller?.getUnassignedItems === "function") {
+      const refresh = controller.getUnassignedItems();
+      if (refresh?.observe) await observableToPromise(refresh);
+      else if (refresh?.then) await refresh;
+    } else if (typeof services?.Item?.requestUnassignedItems === "function") {
+      await observableToPromise(services.Item.requestUnassignedItems());
+    }
+    await delayMs(800);
+  };
+
+  const refreshStoreSection = async () => {
+    try {
+      repositories?.Store?.setDirty?.("ALL");
+    } catch {}
+
+    const storeTab = document.querySelector(".ut-tab-bar-item.icon-store");
+    if (storeTab && safeClick(storeTab)) return true;
+
+    const current = getCurrentEaController();
+    if (typeof current?.getStorePacks === "function") {
+      const refresh = current.getStorePacks(true);
+      if (refresh?.observe) await observableToPromise(refresh);
+      else if (refresh?.then) await refresh;
+      return true;
+    }
+
+    if (typeof services?.Store?.getPacks === "function") {
+      await observableToPromise(services.Store.getPacks("ALL", true, true));
+      return true;
+    }
+    return false;
+  };
+
+  const quickOrganizePackItems = async (
+    packItems = null,
+    { silent = false, refresh = true } = {},
+  ) => {
+    const refreshed = await getUnassignedItems({ refresh: true });
+    const items = refreshed.length
+      ? refreshed
+      : markItemsAsUnassigned(Array.isArray(packItems) ? packItems : []);
+    const duplicates = [];
+    const storeable = [];
+    for (const item of items) {
+      let duplicate = false;
+      try {
+        duplicate =
+          typeof item?.isDuplicate === "function"
+            ? Boolean(item.isDuplicate())
+            : Boolean(item?.isDuplicate);
+      } catch {}
+      (duplicate ? duplicates : storeable).push(item);
+    }
+
+    const moved = await moveItemsToClub(storeable);
+    const ItemPile =
+      services?.Item?.UTItemPileEnum ?? globalThis?.ItemPile ?? {};
+    const storagePile = ItemPile.STORAGE ?? 10;
+    const storageCount = Math.max(
+      0,
+      Number(repositories?.Item?.numItemsInCache?.(storagePile)) || 0,
+    );
+    // SBC Storage currently holds 100 items; keep overflow unassigned.
+    const storageSpace = Math.max(0, 100 - storageCount);
+    const storageEligible = duplicates.filter((item) => {
+      const isPlayer = isPlayerItemEntity(item);
+      const untradeable =
+        typeof item?.isTradeable === "function"
+          ? !item.isTradeable()
+          : Boolean(item?.untradeable) || item?.isTradeable === false;
+      return isPlayer && untradeable && !(Number(item?.loans) > 0);
+    });
+    const toStorage = storageEligible.slice(0, storageSpace);
+    if (toStorage.length) {
+      await observableToPromise(services.Item.move(toStorage, storagePile));
+    }
+    const unresolvedDuplicates = duplicates.length - toStorage.length;
+    clearPlayersSnapshotCache();
+    if (refresh) await refreshVisibleUnassignedItems();
+    if (!silent) {
+      showToast({
+        type: unresolvedDuplicates ? "info" : "success",
+        title: "Quick Organize Complete",
+        message: `${moved} item(s) sent to club; ${toStorage.length} duplicate player(s) sent to SBC Storage${
+          unresolvedDuplicates
+            ? `; ${unresolvedDuplicates} item(s) still need attention.`
+            : "."
+        }`,
+        timeoutMs: 6000,
+      });
+    }
+    if (refresh) setTimeout(() => void refreshStoreSection(), 500);
+    return {
+      moved,
+      stored: toStorage.length,
+      unresolved: unresolvedDuplicates,
+    };
+  };
+
+  const showQuickOrganizeButton = (
+    packItems = null,
+    { source = "pack" } = {},
+  ) => {
+    ensureOpenAllPacksStyles();
+    try {
+      quickOrganizeButton?.remove?.();
+    } catch {}
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "fodder-flow-quick-organize";
+    button.dataset.fodderFlowSource = source;
+    button.textContent = "Quick Organize";
+    button.addEventListener("click", async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      button.textContent = "Organizing…";
+      try {
+        await quickOrganizePackItems(packItems);
+        button.remove();
+        if (quickOrganizeButton === button) quickOrganizeButton = null;
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "Quick Organize";
+        showToast({
+          type: "error",
+          title: "Quick Organize Failed",
+          message: error?.message || "Could not store the pack items.",
+          timeoutMs: 7000,
+        });
+      }
+    });
+    document.body.appendChild(button);
+    quickOrganizeButton = button;
+    return button;
+  };
+
+  let quickOrganizeViewObserver = null;
+  let quickOrganizeViewTimer = null;
+  let quickOrganizeViewCheckRunning = false;
+
+  const isQuickOrganizeView = () => {
+    const queue = [getCurrentEaController()].filter(Boolean);
+    const seen = new Set();
+    while (queue.length) {
+      const controller = queue.shift();
+      if (!controller || seen.has(controller)) continue;
+      seen.add(controller);
+      const name = String(
+        controller?.className ?? controller?.constructor?.name ?? "",
+      );
+      if (/unassigned|player.?pick|item.?(?:pick|choice)|reward.?pick/i.test(name)) {
+        return true;
+      }
+      queue.push(...Array.from(controller?.childViewControllers ?? []));
+    }
+    return Boolean(
+      document.querySelector(
+        '[class*="unassigned" i], [class*="player-pick" i], [class*="playerpick" i], [class*="item-choice" i], [class*="reward-pick" i]',
+      ),
+    );
+  };
+
+  const syncQuickOrganizeForCurrentView = async () => {
+    if (quickOrganizeViewCheckRunning) return;
+    quickOrganizeViewCheckRunning = true;
+    try {
+      if (!isQuickOrganizeView()) {
+        if (
+          quickOrganizeButton?.dataset?.fodderFlowSource === "view"
+        ) {
+          quickOrganizeButton.remove();
+          quickOrganizeButton = null;
+        }
+        return;
+      }
+      const items = await getUnassignedItems({ refresh: false });
+      if (!items.length || quickOrganizeButton?.isConnected) return;
+      showQuickOrganizeButton(items, { source: "view" });
+    } catch {
+    } finally {
+      quickOrganizeViewCheckRunning = false;
+    }
+  };
+
+  const scheduleQuickOrganizeViewSync = () => {
+    clearTimeout(quickOrganizeViewTimer);
+    quickOrganizeViewTimer = setTimeout(
+      () => void syncQuickOrganizeForCurrentView(),
+      120,
+    );
+  };
+
+  const initQuickOrganizeViewObserver = () => {
+    if (quickOrganizeViewObserver || !document?.documentElement) return;
+    quickOrganizeViewObserver = new MutationObserver(scheduleQuickOrganizeViewSync);
+    quickOrganizeViewObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+    window.addEventListener("hashchange", scheduleQuickOrganizeViewSync);
+    window.addEventListener("popstate", scheduleQuickOrganizeViewSync);
+    window.addEventListener("focus", scheduleQuickOrganizeViewSync, {
+      passive: true,
+    });
+    scheduleQuickOrganizeViewSync();
+  };
+
+  initQuickOrganizeViewObserver();
 
   const initPackQuickOpenAnimationHook = () => {
     try {
       const animationProto = globalThis?.UTPackAnimationViewController?.prototype;
-      const presentationProto = globalThis?.UTPresentationController?.prototype;
-      if (!animationProto || !presentationProto) return false;
+      if (!animationProto) return false;
 
-      // Match the enhancer behavior: while quick-open is armed, skip the
-      // animation callback instead of running the normal pack animation.
+      // Keep EA's normal presentation lifecycle, then shorten only its timer.
+      // Calling runCallback before present() leaves an invisible click shield.
       if (typeof animationProto.runAnimation === "function" &&
           !animationProto.runAnimation.__fodderFlowQuickOpen) {
         const originalRunAnimation = animationProto.runAnimation;
         const patchedRunAnimation = function (...args) {
           if (packQuickOpenState.fastPackOpen) {
-            // Do NOT clear the flag before UTPresentationController.present
-            // gets a chance to see it. The reference enhancer keeps the flag
-            // set during this transition as well.
-            const callback = this?.runCallback;
-            let result;
-            if (typeof callback === "function") {
-              result = callback.call(this);
-            } else {
-              result = undefined;
-            }
-            // Prevent the flag from affecting a later, unrelated pack open.
-            setTimeout(() => {
+            const result = originalRunAnimation.call(this, ...args);
+            try {
+              clearTimeout(this?.animationTimeout);
+            } catch {}
+            this.animationTimeout = setTimeout(() => {
               packQuickOpenState.fastPackOpen = false;
-            }, 1500);
+              this?.runCallback?.();
+            }, 0);
             return result;
           }
           return originalRunAnimation.call(this, ...args);
@@ -30661,26 +31438,8 @@
         animationProto.runAnimation = patchedRunAnimation;
       }
 
-      if (typeof presentationProto.present === "function" &&
-          !presentationProto.present.__fodderFlowQuickOpen) {
-        const originalPresent = presentationProto.present;
-        const patchedPresent = function (show, ...args) {
-          if (
-            packQuickOpenState.fastPackOpen &&
-            globalThis?.UTPackAnimationViewController &&
-            this?.presentedViewController instanceof globalThis.UTPackAnimationViewController
-          ) {
-            show = false;
-          }
-          return originalPresent.call(this, show, ...args);
-        };
-        patchedPresent.__fodderFlowQuickOpen = true;
-        presentationProto.present = patchedPresent;
-      }
-
       packQuickOpenState.animationHooked =
-        !!animationProto.runAnimation.__fodderFlowQuickOpen &&
-        !!presentationProto.present.__fodderFlowQuickOpen;
+        !!animationProto.runAnimation.__fodderFlowQuickOpen;
       return packQuickOpenState.animationHooked;
     } catch (error) {
       console.warn("[Fodder Flow] Pack animation hook failed", error);
@@ -30720,15 +31479,16 @@
               const tapEvent = globalThis.EventType?.TAP;
               const openEvent = globalThis.UTStorePackDetailsView?.Event?.OPEN;
               if (tapEvent && openEvent && typeof this._triggerActions === "function") {
-                button.addTarget(this, () => {
-                  packQuickOpenState.fastPackOpen = true;
-                  this._triggerActions(openEvent, {
+                 button.addTarget(this, () => {
+                   packQuickOpenState.fastPackOpen = true;
+                   this._triggerActions(openEvent, {
                     articleId:
                       typeof this.getArticleId === "function"
                         ? this.getArticleId()
-                        : this.articleId,
-                  });
-                }, tapEvent);
+                         : this.articleId,
+                   });
+                   setTimeout(() => showQuickOrganizeButton(), 900);
+                 }, tapEvent);
                 this.appendActionButton(button);
                 this.custom_fodderFlowQuickOpen = button;
               }
@@ -30806,9 +31566,6 @@
   // PACK: OPEN ALL MY PACKS (additive)
   // Sequentially opens the packs already present in My Packs using
   // EA's own pack entity. No direct HTTP calls or concurrent opens.
-  // A small delay is used between opens; this cannot guarantee that
-  // EA will consider automation permitted, so the feature should be
-  // used only where allowed by EA's rules.
   // ============================================================
   const openAllPacksState = {
     running: false,
@@ -30819,9 +31576,6 @@
     button: null,
     wrapper: null,
   };
-
-  const packAutomationDelay = (min = 4500, max = 6500) =>
-    Math.floor(min + Math.random() * Math.max(1, max - min));
 
   const getPackItemName = (item) => {
     try {
@@ -30849,6 +31603,23 @@
     }
   };
 
+  const getReadablePackName = (pack) => {
+    const candidates = [
+      pack?.displayName,
+      typeof pack?.getPackName === "function" ? pack.getPackName() : null,
+      pack?.name,
+      pack?.packName,
+    ]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean);
+    const readable = candidates.find((value) => !/^FUT_STORE_PACK_/i.test(value));
+    if (readable) return readable;
+    const packNumber = candidates
+      .map((value) => value.match(/FUT_STORE_PACK_(\d+)/i)?.[1])
+      .find(Boolean);
+    return packNumber ? `Pack ${packNumber}` : "Pack";
+  };
+
   const makePackResultData = (pack, response) => {
     // EA pack.open() resolves to an operation result whose actual reward
     // items are normally under response.items. Some builds wrap that result
@@ -30860,31 +31631,49 @@
         : Array.isArray(response?.data?.items)
           ? response.data.items
           : [];
-    const items = rawItems.map((item, index) => ({
-      index,
-      name: getPackItemName(item),
-      rating: getPackItemRating(item),
-      definitionId: item?.definitionId ?? null,
-      image: getPackItemImage(item),
-      isPlayer: isPlayerItemEntity(item),
-      untradeable:
-        typeof item?.isTradeable === "function"
-          ? !item.isTradeable()
-          : item?.isTradeable === false,
-    }));
+    const items = rawItems.map((item, index) => {
+      const isPlayer = isPlayerItemEntity(item);
+      const rawName = getPackItemName(item);
+      const name = /^[-—]+$/.test(rawName) ? (isPlayer ? "Player item" : "Pack item") : rawName;
+      return {
+        index,
+        name,
+        rating: getPackItemRating(item),
+        definitionId: item?.definitionId ?? null,
+        image: getPackItemImage(item),
+        imageCandidates: isPlayer ? getPlayerImageCandidates(item) : [],
+        isPlayer,
+        isSpecial:
+          typeof item?.isSpecial === "function"
+            ? Boolean(item.isSpecial())
+            : Boolean(item?.isSpecial),
+        rarityName: resolveEntityRarityName(item),
+        preferredPositionName:
+          sanitizeDisplayText(item?.preferredPositionName) ??
+          sanitizeDisplayText(
+            getPositionName(
+              item?.preferredPosition ?? item?.preferredPositionId ?? null,
+            ),
+          ),
+        clubName: resolveEntityClubName(item),
+        nationName: resolveEntityNationName(item),
+        untradeable:
+          typeof item?.isTradeable === "function"
+            ? !item.isTradeable()
+            : item?.isTradeable === false,
+      };
+    });
     const topCard =
       items
         .filter((item) => item.isPlayer || item.rating > 0)
         .sort((a, b) => b.rating - a.rating)[0] ?? items[0] ?? null;
     return {
-      packName:
-        typeof pack?.getPackName === "function"
-          ? pack.getPackName()
-          : pack?.packName ?? pack?.name ?? "Pack",
+      packName: getReadablePackName(pack),
       packId: pack?.id ?? null,
       success: response?.success === true,
       status: response?.status ?? null,
       items,
+      rawItems: markItemsAsUnassigned(rawItems),
       topCard,
     };
   };
@@ -30917,22 +31706,53 @@
         opacity: .55;
         cursor: default;
       }
+      .fodder-flow-quick-organize {
+        position: fixed;
+        z-index: 2147483647;
+        left: 50%;
+        bottom: 28px;
+        transform: translateX(-50%);
+        min-width: 210px;
+        min-height: 46px;
+        padding: 10px 20px;
+        border: 1px solid rgba(255,255,255,.3);
+        border-radius: 999px;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 800;
+        color: #fff;
+        background: linear-gradient(90deg, rgba(35, 180, 210, .98), rgba(88, 75, 205, .98));
+        box-shadow: 0 12px 32px rgba(0,0,0,.45);
+      }
+      .fodder-flow-quick-organize:disabled {
+        opacity: .6;
+        cursor: default;
+      }
       .fodder-flow-pack-results {
         position: fixed;
         z-index: 2147483646;
         left: 50%;
-        top: 8%;
-        transform: translateX(-50%);
-        width: min(680px, calc(100vw - 32px));
-        max-height: 78vh;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: min(460px, calc(100vw - 28px));
+        max-height: 72vh;
         overflow: auto;
-        padding: 18px;
-        border-radius: 12px;
-        background: rgba(20, 20, 30, .97);
+        padding: 14px;
+        border-radius: 14px;
+        background: rgba(13, 14, 20, .98);
         border: 1px solid rgba(255,255,255,.18);
         box-shadow: 0 18px 60px rgba(0,0,0,.55);
         color: #fff;
-        font-family: inherit;
+        font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif !important;
+        font-size: 13px;
+      }
+      .fodder-flow-pack-results * {
+        box-sizing: border-box;
+        font-family: inherit !important;
+      }
+      .fodder-flow-pack-results h2 {
+        font-size: 19px;
+        line-height: 1.2;
       }
       .fodder-flow-pack-results__top {
         display: flex;
@@ -30966,11 +31786,133 @@
       .fodder-flow-pack-results__name { font-size: .82rem; }
       .fodder-flow-pack-results__items {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+        grid-template-columns: 1fr;
+        gap: 6px;
+        max-height: 180px;
+        overflow-y: auto;
+      }
+      .fodder-flow-pack-summary__stats {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+      .fodder-flow-pack-summary__stat {
+        padding: 8px 4px;
+        border-radius: 8px;
+        text-align: center;
+        background: rgba(255,255,255,.07);
+      }
+      .fodder-flow-pack-summary__stat strong {
+        display: block;
+        font-size: 1.15rem;
+        color: #42d7ff;
+      }
+      .fodder-flow-pack-summary__stat span {
+        color: rgba(255,255,255,.68);
+        font-size: 11px;
+      }
+      .fodder-flow-pack-summary__section-title {
+        margin: 11px 0 6px;
+        color: rgba(255,255,255,.55);
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: .7px;
+        text-transform: uppercase;
+      }
+      .fodder-flow-pack-summary__organization {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .fodder-flow-pack-summary__warning {
+        margin-bottom: 10px;
+        padding: 8px 10px;
+        border: 1px solid rgba(255,130,70,.55);
+        border-radius: 8px;
+        background: rgba(255,90,40,.12);
+        color: #ffc2a3;
+        font-size: 12px;
+      }
+      .fodder-flow-pack-summary__packs {
+        display: grid;
         gap: 8px;
+        max-height: 280px;
+        overflow-y: auto;
+        padding-right: 3px;
+      }
+      .fodder-flow-pack-summary__pack {
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 9px;
+        background: rgba(255,255,255,.025);
+      }
+      .fodder-flow-pack-summary__pack-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 7px 9px;
+        background: rgba(255,255,255,.07);
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .fodder-flow-pack-summary__card-list {
+        display: grid;
+      }
+      .fodder-flow-pack-summary__card-row {
+        min-width: 0;
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        min-height: 58px;
+        padding: 5px 8px;
+        border-top: 1px solid rgba(255,255,255,.06);
+      }
+      .fodder-flow-pack-summary__card-art {
+        position: relative;
+        width: 38px;
+        height: 48px;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        border-radius: 6px;
+        background: linear-gradient(145deg, #b89538, #4d3918);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .fodder-flow-pack-summary__card-art img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+      .fodder-flow-pack-summary__card-info { min-width: 0; }
+      .fodder-flow-pack-summary__card-name {
+        overflow: hidden;
+        color: rgba(255,255,255,.94);
+        font-size: 12px;
+        font-weight: 750;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .fodder-flow-pack-summary__card-meta {
+        margin-top: 2px;
+        overflow: hidden;
+        color: rgba(255,255,255,.5);
+        font-size: 9px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .fodder-flow-pack-summary__card-rating {
+        color: #42d7ff;
+        font-size: 15px;
+        font-weight: 850;
       }
       .fodder-flow-pack-results__item {
-        padding: 9px 11px;
+        padding: 7px 9px;
         border-radius: 7px;
         background: rgba(255,255,255,.06);
         display: flex;
@@ -30978,12 +31920,16 @@
         gap: 10px;
       }
       .fodder-flow-pack-results__close {
-        margin-top: 14px;
+        margin-top: 12px;
         width: 100%;
-        min-height: 38px;
+        min-height: 34px;
         border: 0;
-        border-radius: 6px;
+        border-radius: 8px;
         cursor: pointer;
+        color: #061018;
+        background: #27baff;
+        font-size: 12px;
+        font-weight: 800;
       }
     `;
     document.head.appendChild(style);
@@ -31050,9 +31996,202 @@
     }
     overlay.appendChild(itemsWrap);
 
+    const organize = document.createElement("button");
+    organize.className = "fodder-flow-pack-results__close";
+    organize.textContent = "Quick Organize";
+    organize.addEventListener("click", async () => {
+      organize.disabled = true;
+      organize.textContent = "Organizing…";
+      try {
+        await quickOrganizePackItems(result.rawItems);
+        try {
+          quickOrganizeButton?.remove?.();
+        } catch {}
+        quickOrganizeButton = null;
+        hidePackResultOverlay();
+      } catch (error) {
+        organize.disabled = false;
+        organize.textContent = "Quick Organize";
+        showToast({
+          type: "error",
+          title: "Quick Organize Failed",
+          message: error?.message || "Could not store the pack items.",
+        });
+      }
+    });
+    overlay.appendChild(organize);
+
     const close = document.createElement("button");
     close.className = "fodder-flow-pack-results__close";
     close.textContent = "Close results";
+    close.addEventListener("click", hidePackResultOverlay);
+    overlay.appendChild(close);
+
+    document.body.appendChild(overlay);
+    packResultOverlay = overlay;
+  };
+
+  const showOpenAllPacksSummary = ({ results, total, organized, stopReason }) => {
+    ensureOpenAllPacksStyles();
+    hidePackResultOverlay();
+    const allItems = results.flatMap((result) => result?.items ?? []);
+    const players = allItems.filter((item) => item?.isPlayer);
+    const specials = players.filter((item) => item?.isSpecial);
+    const topCards = results
+      .map((result) => ({ packName: result?.packName, ...result?.topCard }))
+      .filter((item) => item?.name)
+      .sort((a, b) => (b?.rating ?? 0) - (a?.rating ?? 0));
+
+    const overlay = document.createElement("div");
+    overlay.className = "fodder-flow-pack-results";
+    overlay.setAttribute("role", "dialog");
+    overlay.setAttribute("aria-modal", "true");
+
+    const title = document.createElement("h2");
+    title.textContent = "Quick Open Summary";
+    title.style.margin = "0 0 12px";
+    overlay.appendChild(title);
+
+    if (stopReason) {
+      const warning = document.createElement("div");
+      warning.className = "fodder-flow-pack-summary__warning";
+      warning.textContent = stopReason;
+      overlay.appendChild(warning);
+    }
+
+    const stats = document.createElement("div");
+    stats.className = "fodder-flow-pack-summary__stats";
+    for (const [label, value] of [
+      ["Packs", `${results.length}/${total}`],
+      ["Items", allItems.length],
+      ["Players", players.length],
+      ["Specials", specials.length],
+    ]) {
+      const stat = document.createElement("div");
+      stat.className = "fodder-flow-pack-summary__stat";
+      const number = document.createElement("strong");
+      number.textContent = String(value);
+      const caption = document.createElement("span");
+      caption.textContent = label;
+      stat.append(number, caption);
+      stats.appendChild(stat);
+    }
+    overlay.appendChild(stats);
+
+    const organizationTitle = document.createElement("div");
+    organizationTitle.className = "fodder-flow-pack-summary__section-title";
+    organizationTitle.textContent = "Organization";
+    overlay.appendChild(organizationTitle);
+
+    const organization = document.createElement("div");
+    organization.className = "fodder-flow-pack-summary__organization";
+    for (const [label, value] of [
+      ["To Club", organized.moved],
+      ["SBC Storage", organized.stored],
+      ["Unresolved", organized.unresolved],
+    ]) {
+      const stat = document.createElement("div");
+      stat.className = "fodder-flow-pack-summary__stat";
+      const number = document.createElement("strong");
+      number.textContent = String(value);
+      const caption = document.createElement("span");
+      caption.textContent = label;
+      stat.append(number, caption);
+      organization.appendChild(stat);
+    }
+    overlay.appendChild(organization);
+
+    const detail = document.createElement("div");
+    detail.style.cssText = "margin-top:8px;color:rgba(255,255,255,.62);font-size:11px";
+    detail.textContent = `Untradeable players ${players.filter((item) => item.untradeable).length} · Highest rating ${topCards[0]?.rating || "n/a"}`;
+    overlay.appendChild(detail);
+
+    const pullsTitle = document.createElement("div");
+    pullsTitle.className = "fodder-flow-pack-summary__section-title";
+    pullsTitle.textContent = "Pack Contents";
+    overlay.appendChild(pullsTitle);
+
+    const packGroups = document.createElement("div");
+    packGroups.className = "fodder-flow-pack-summary__packs";
+    results.forEach((result, packIndex) => {
+      const group = document.createElement("section");
+      group.className = "fodder-flow-pack-summary__pack";
+      const header = document.createElement("div");
+      header.className = "fodder-flow-pack-summary__pack-header";
+      const packName = document.createElement("span");
+      packName.textContent = `Pack ${packIndex + 1} · ${result?.packName ?? "Pack"}`;
+      const itemCount = document.createElement("span");
+      itemCount.textContent = `${result?.items?.length ?? 0} items`;
+      header.append(packName, itemCount);
+      group.appendChild(header);
+
+      const list = document.createElement("div");
+      list.className = "fodder-flow-pack-summary__card-list";
+      for (const item of result?.items ?? []) {
+        const row = document.createElement("div");
+        row.className = "fodder-flow-pack-summary__card-row";
+
+        const art = document.createElement("div");
+        art.className = "fodder-flow-pack-summary__card-art";
+        art.textContent = item?.rating ? String(item.rating) : "ITEM";
+        const images = [item?.image, ...(item?.imageCandidates ?? [])]
+          .filter(Boolean)
+          .filter((value, index, values) => values.indexOf(value) === index);
+        if (images.length) {
+          const img = document.createElement("img");
+          img.alt = `${item?.name ?? "Item"} card`;
+          let imageIndex = 0;
+          img.addEventListener("error", () => {
+            imageIndex += 1;
+            if (imageIndex < images.length) img.src = images[imageIndex];
+            else img.remove();
+          });
+          img.src = images[0];
+          art.appendChild(img);
+        }
+
+        const info = document.createElement("div");
+        info.className = "fodder-flow-pack-summary__card-info";
+        const name = document.createElement("div");
+        name.className = "fodder-flow-pack-summary__card-name";
+        name.textContent = item?.name ?? "Unknown item";
+        name.title = name.textContent;
+        const meta = document.createElement("div");
+        meta.className = "fodder-flow-pack-summary__card-meta";
+        meta.textContent = [
+          item?.rarityName,
+          item?.preferredPositionName,
+          item?.clubName,
+          item?.nationName,
+          item?.untradeable ? "Untradeable" : null,
+        ]
+          .map(sanitizeDisplayText)
+          .filter(Boolean)
+          .join(" · ");
+        meta.title = meta.textContent;
+        info.append(name);
+        if (meta.textContent) info.append(meta);
+
+        const rating = document.createElement("div");
+        rating.className = "fodder-flow-pack-summary__card-rating";
+        rating.textContent = item?.rating ? String(item.rating) : "";
+        row.append(art, info, rating);
+        list.appendChild(row);
+      }
+      if (!result?.items?.length) {
+        const empty = document.createElement("div");
+        empty.className = "fodder-flow-pack-results__item";
+        empty.textContent = "EA returned no item details for this pack.";
+        list.appendChild(empty);
+      }
+      group.appendChild(list);
+      packGroups.appendChild(group);
+    });
+    overlay.appendChild(packGroups);
+
+    const close = document.createElement("button");
+    close.className = "fodder-flow-pack-results__close";
+    close.textContent = "Close Summary";
     close.addEventListener("click", hidePackResultOverlay);
     overlay.appendChild(close);
 
@@ -31086,6 +32225,8 @@
     openAllPacksState.stopRequested = false;
     openAllPacksState.opened = 0;
     openAllPacksState.lastResults = [];
+    const organized = { moved: 0, stored: 0, unresolved: 0 };
+    let stopReason = "";
 
     const button = openAllPacksState.button;
     if (button) {
@@ -31105,29 +32246,24 @@
         return;
       }
 
+      if (
+        globalThis?.repositories?.Item &&
+        globalThis?.ItemPile?.PURCHASED !== undefined &&
+        typeof repositories.Item.numItemsInCache === "function" &&
+        repositories.Item.numItemsInCache(ItemPile.PURCHASED)
+      ) {
+        showToast({
+          type: "error",
+          title: "Open All Packs",
+          message: "Clear the existing unassigned items first.",
+        });
+        return;
+      }
+
       for (const pack of packs) {
         if (openAllPacksState.stopRequested) break;
 
-        // Match the enhancer's safety check: never open another pack while
-        // the purchased/unassigned pile still contains items.
-        try {
-          if (globalThis?.repositories?.Item &&
-              globalThis?.ItemPile?.PURCHASED !== undefined &&
-              typeof repositories.Item.numItemsInCache === "function" &&
-              repositories.Item.numItemsInCache(ItemPile.PURCHASED)) {
-            showToast({
-              type: "error",
-              title: "Open All Packs stopped",
-              message: "There are still unassigned pack items. Clear them before continuing.",
-            });
-            break;
-          }
-        } catch {}
-
-        const packName =
-          typeof pack?.getPackName === "function"
-            ? pack.getPackName()
-            : pack?.packName ?? pack?.name ?? "Pack";
+        const packName = getReadablePackName(pack);
         if (!pack || typeof pack.open !== "function") {
           showToast({
             type: "error",
@@ -31144,51 +32280,51 @@
           const result = makePackResultData(pack, response);
           openAllPacksState.lastResults.push(result);
           openAllPacksState.opened += 1;
-          showPackResultOverlay(
-            result,
-            openAllPacksState.opened,
-            openAllPacksState.total,
-          );
-          showToast({
-            type: result.success ? "success" : "error",
-            title: `${openAllPacksState.opened}/${openAllPacksState.total} opened`,
-            message: result.topCard
-              ? `Top card: ${result.topCard.name} (${result.topCard.rating || "—"})`
-              : packName,
+          if (button) {
+            button.textContent = `Quick Opening ${openAllPacksState.opened}/${openAllPacksState.total}…`;
+          }
+          const organizeResult = await quickOrganizePackItems(result.rawItems, {
+            silent: true,
+            refresh: false,
           });
-
-          // Keep each result visible for a short period, then close it before
-          // the next pack. This makes the sequence readable without stacking
-          // multiple result dialogs.
-          await delayMs(3500);
-          hidePackResultOverlay();
-          await delayMs(packAutomationDelay(2500, 4500));
+          organized.moved += organizeResult.moved;
+          organized.stored += organizeResult.stored;
+          organized.unresolved += organizeResult.unresolved;
+          if (organizeResult.unresolved > 0) {
+            stopReason = `${organizeResult.unresolved} duplicate item(s) need attention before more packs can be opened.`;
+            break;
+          }
         } catch (error) {
           packQuickOpenState.fastPackOpen = false;
+          stopReason = error?.message || `${packName} failed to open.`;
           showToast({
             type: "error",
             title: "Pack opening stopped",
-            message: error?.message || `${packName} failed to open.`,
+            message: stopReason,
           });
           break;
         } finally {
-          setTimeout(() => {
-            packQuickOpenState.fastPackOpen = false;
-          }, 1000);
+          packQuickOpenState.fastPackOpen = false;
         }
       }
     } finally {
       openAllPacksState.running = false;
       if (button) {
         button.disabled = false;
-        button.textContent = "Open All Packs";
+        button.textContent = `Open All Packs (${openAllPacksState.total})`;
       }
-      if (!openAllPacksState.stopRequested && openAllPacksState.opened) {
-        showToast({
-          type: "success",
-          title: "Open All Packs finished",
-          message: `${openAllPacksState.opened}/${openAllPacksState.total} packs opened.`,
-          timeoutMs: 2500,
+      if (openAllPacksState.opened) {
+        try {
+          await refreshVisibleUnassignedItems();
+          void refreshStoreSection();
+        } catch {}
+        showOpenAllPacksSummary({
+          results: openAllPacksState.lastResults,
+          total: openAllPacksState.total,
+          organized,
+          stopReason:
+            stopReason ||
+            (openAllPacksState.stopRequested ? "Opening was stopped." : ""),
         });
       }
     }
@@ -31833,4 +32969,3 @@
     }
   } catch {}
 })();
-

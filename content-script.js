@@ -249,7 +249,7 @@ void (async () => {
   }
 })();
 
-const CONTENT_SCRIPT_VERSION = "2026-03-03b";
+const CONTENT_SCRIPT_VERSION = "2026-09-01a";
 console.log("[EA Data] Content script loaded", {
   version: CONTENT_SCRIPT_VERSION,
 });
@@ -294,8 +294,35 @@ const solverBridgeSeen = new Set();
 let solverWorkerInitPromise = null;
 const solverWorkerRequests = new Map();
 let solverPort = null;
+let extensionContextReloadScheduled = false;
 
 const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const isExtensionContextInvalidError = (error) => {
+  const message = String(error?.message || error || "");
+  if (message.includes("Extension context invalidated")) return true;
+  try {
+    return !chrome?.runtime?.id;
+  } catch {
+    return true;
+  }
+};
+
+const scheduleExtensionContextReload = (error) => {
+  if (!isExtensionContextInvalidError(error)) return false;
+  if (extensionContextReloadScheduled) return true;
+  extensionContextReloadScheduled = true;
+  try {
+    document.documentElement.dataset.eaDataContextRecovery = "reloading";
+  } catch {}
+  console.warn("[EA Data] Extension context changed; reloading EA Web App.");
+  setTimeout(() => {
+    try {
+      window.location.reload();
+    } catch {}
+  }, 100);
+  return true;
+};
 
 const createRequestId = () => {
   if (crypto?.randomUUID) return crypto.randomUUID();
@@ -463,6 +490,9 @@ const callSolverWorker = async (
   try {
     return await callSolverWorkerOnce(type, payload, timeoutMs);
   } catch (error) {
+    if (scheduleExtensionContextReload(error)) {
+      return new Promise(() => {});
+    }
     if (!retries || !isRetryableSolverError(error)) throw error;
     // Force a clean reconnect and retry once for MV3 service worker restarts.
     try {
@@ -577,12 +607,14 @@ const storageLocalGet = (key) =>
       chrome.storage.local.get([key], (items) => {
         const err = chrome?.runtime?.lastError;
         if (err) {
+          if (scheduleExtensionContextReload(err)) return;
           reject(new Error(err.message || "storage get failed"));
           return;
         }
         resolve(items ? items[key] : null);
       });
     } catch (error) {
+      if (scheduleExtensionContextReload(error)) return;
       reject(error);
     }
   });
@@ -597,12 +629,14 @@ const storageLocalSet = (key, value) =>
       chrome.storage.local.set({ [key]: value }, () => {
         const err = chrome?.runtime?.lastError;
         if (err) {
+          if (scheduleExtensionContextReload(err)) return;
           reject(new Error(err.message || "storage set failed"));
           return;
         }
         resolve(true);
       });
     } catch (error) {
+      if (scheduleExtensionContextReload(error)) return;
       reject(error);
     }
   });
@@ -705,6 +739,7 @@ const handlePriceBridgeRequest = async (data) => {
       (response) => {
         const runtimeError = chrome.runtime?.lastError;
         if (runtimeError) {
+          if (scheduleExtensionContextReload(runtimeError)) return;
           console.log("[EA Data] Price bridge runtime error", {
             requestId,
             message: runtimeError.message || "Price bridge failed",
@@ -738,6 +773,7 @@ const handlePriceBridgeRequest = async (data) => {
       },
     );
   } catch (error) {
+    if (scheduleExtensionContextReload(error)) return;
     console.log("[EA Data] Price bridge exception", {
       requestId,
       message: error?.message || String(error),
@@ -764,6 +800,7 @@ const handleFutggPlayersBridgeRequest = async (data) => {
       (response) => {
         const runtimeError = chrome.runtime?.lastError;
         if (runtimeError) {
+          if (scheduleExtensionContextReload(runtimeError)) return;
           postFutggPlayersResponse(requestId, false, null, {
             code: "FUTGG_PLAYERS_BRIDGE_FAILED",
             message: runtimeError.message || "FUT.GG players bridge failed",
@@ -781,6 +818,7 @@ const handleFutggPlayersBridgeRequest = async (data) => {
       },
     );
   } catch (error) {
+    if (scheduleExtensionContextReload(error)) return;
     postFutggPlayersResponse(requestId, false, null, {
       code: "FUTGG_PLAYERS_BRIDGE_FAILED",
       message: error?.message || "FUT.GG players bridge failed",

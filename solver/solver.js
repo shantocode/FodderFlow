@@ -244,6 +244,16 @@ const isTotsPlayer = (player) => {
 const isTotwOrTotsPlayer = (player) =>
   isTotwPlayer(player) || isTotsPlayer(player);
 
+const isFofOrFuttiesPlayer = (player) => {
+  const rarity = normalizeString(player?.rarityName);
+  return Boolean(
+    rarity &&
+      (rarity.includes("festival of football") ||
+        rarity.includes("fof") ||
+        rarity.includes("futties")),
+  );
+};
+
 const isRareBasePlayer = (player) => {
   const rarity = normalizeString(player?.rarityName);
   if (rarity?.includes("rare")) return true;
@@ -1220,7 +1230,16 @@ const buildPredicate = (rule) => {
     return buildQualityGatePredicate(rule);
   }
   if (type === "player_totw_or_tots") {
-    return (player) => isTotwOrTotsPlayer(player);
+    const label = normalizeString(rule?.raw?.label || rule?.label);
+    const includesFofOrFutties = Boolean(
+      label &&
+        (label.includes("festival of football") ||
+          label.includes("fof") ||
+          label.includes("futties")),
+    );
+    return (player) =>
+      isTotwOrTotsPlayer(player) ||
+      (includesFofOrFutties && isFofOrFuttiesPlayer(player));
   }
   if (type === "player_tots") {
     return (player) => isTotsPlayer(player);
@@ -1445,11 +1464,12 @@ const buildRatingBucketCandidates = (players, options = {}) => {
     );
   const maxCandidates = Math.max(1, toNumber(options?.maxCandidates) ?? 240);
   const perRatingLimit = Math.max(1, toNumber(options?.perRatingLimit) ?? 32);
+  const avoidSpecials = options?.avoidSpecials !== false;
   const specialPerRatingLimit = Math.max(
     1,
-    toNumber(options?.specialPerRatingLimit) ?? 8,
+    toNumber(options?.specialPerRatingLimit) ??
+      (avoidSpecials ? 8 : perRatingLimit),
   );
-  const avoidSpecials = options?.avoidSpecials !== false;
   const avoidTotwOrTots = options?.avoidTotwOrTots !== false;
   const includeFallback = options?.includeFallback !== false;
   const initialBelow = Math.max(0, toNumber(options?.initialBelow) ?? 2);
@@ -2644,6 +2664,7 @@ const improveRatingSmart = (
   const requiredInforms = Math.max(0, toNumber(options?.requiredInforms) ?? 0);
   const requiredSpecials = Math.max(0, toNumber(options?.requiredSpecials) ?? 0);
   const avoidInforms = options?.avoidInforms !== false;
+  const avoidSpecials = options?.avoidSpecials !== false;
   const avoidTotwOrTots = options?.avoidTotwOrTots !== false;
   const preferLowerExcessInforms = options?.preferLowerExcessInforms !== false;
   const seed = options?.seed ?? null;
@@ -2726,9 +2747,9 @@ const improveRatingSmart = (
       initialAbove: Math.max(0, Math.min(capNum - pivot, capOffset)),
       maxNormalBelow: window,
       maxNormalAbove: Math.max(0, capNum - pivot),
-      avoidSpecials: !includeInformCandidates,
+      avoidSpecials,
       avoidTotwOrTots: !includeInformCandidates,
-      includeFallback: includeInformCandidates,
+      includeFallback: includeInformCandidates || !avoidSpecials,
     });
     return candidates;
   };
@@ -11241,7 +11262,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
     squad = buildPureRatingOnlySquad(squad, pool, squadSize, lockedIds, {
       ratingTarget: ratingRequirement?.target ?? null,
       pivot: ratingFillHint?.pivot ?? null,
-      avoidSpecials: true,
+      avoidSpecials: excludeSpecial,
       avoidTotwOrTots: !explicitTotwOrTotsRequirement,
       debugPush,
     });
@@ -11267,8 +11288,10 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
       const ra = toNumber(a?.rating) ?? 0;
       const rb = toNumber(b?.rating) ?? 0;
       if (ra !== rb) return ra - rb;
-      const specialDiff = (a?.isSpecial ? 1 : 0) - (b?.isSpecial ? 1 : 0);
-      if (specialDiff !== 0) return specialDiff;
+      if (excludeSpecial) {
+        const specialDiff = (a?.isSpecial ? 1 : 0) - (b?.isSpecial ? 1 : 0);
+        if (specialDiff !== 0) return specialDiff;
+      }
       return getStoragePreferenceScore(b) - getStoragePreferenceScore(a);
     });
 
@@ -11426,6 +11449,7 @@ const runPipeline = (inputContext, seed = null, phaseConfig = null) => {
           requiredInforms: informBounds?.min ?? 0,
           requiredSpecials: specialBounds?.min ?? 0,
           avoidInforms: context?.optimize?.avoidInforms !== false,
+          avoidSpecials: excludeSpecial,
           avoidTotwOrTots:
             useTotwPlayers && !explicitTotwOrTotsRequirement
               ? context?.optimize?.avoidTotwOrTots !== false
