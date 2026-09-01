@@ -914,23 +914,100 @@
     const assetId =
       encodedPlayerId == null ? null : encodedPlayerId % 16777216;
     const base = `https://www.ea.com/ea-sports-fc/ultimate-team/web-app/content/${getEaContentHash()}/2026/fut`;
+    // Prefer any URL the app has already resolved for this player -- these
+    // are far more likely to load on the first try than a guessed path.
+    add(player?.imageUrl);
+    add(player?.largeImgUrl);
+    add(player?.imgUrl);
+    add(player?.headshot?.largeImgUrl);
+    add(player?.headshot?.imgUrl);
+    add(player?._staticData?.imageUrl);
+    add(player?._staticData?.largeImgUrl);
     if (assetId != null) {
+      // Fall back to a few known render sizes/paths for this asset id.
       add(`${base}/items/images/players/html5/120x120/p${assetId}.png`);
-    } else {
-      add(player?.imageUrl);
-      add(player?.largeImgUrl);
-      add(player?.imgUrl);
-      add(player?.headshot?.largeImgUrl);
-      add(player?.headshot?.imgUrl);
-      add(player?._staticData?.imageUrl);
-      add(player?._staticData?.largeImgUrl);
+      add(`${base}/items/images/players/html5/256x256/p${assetId}.png`);
+      add(`${base}/items/images/players/p${assetId}.png`);
     }
     return candidates;
   };
 
+  // Ordered [match-substrings, css-class] pairs so specific rarities (icon,
+  // totw, tots, etc.) get their own card color instead of every "special"
+  // card collapsing into one flat blue.
+  const RARITY_VISUAL_RULES = [
+    [["icon", "time warp icon", "prime icon", "moments icon"], "icon"],
+    [["hero", "moments hero"], "hero"],
+    [["team of the season", "tots"], "tots"],
+    [["team of the week", "totw", "inform"], "totw"],
+    [["team of the year", "toty"], "toty"],
+    [["ones to watch", "otw"], "otw"],
+    [["future stars"], "future-stars"],
+    [["winter wildcards"], "winter-wildcards"],
+    [["path to glory", "ptg"], "path-to-glory"],
+    [["showdown"], "showdown"],
+    [["centurion"], "centurion"],
+    [["shapeshifter"], "shapeshifter"],
+    [["flashback"], "flashback"],
+    [["rttf", "road to the final"], "rttf"],
+    [["futties"], "futties"],
+    [["trailblazer"], "trailblazer"],
+    [["marquee matchup"], "marquee"],
+    [["player of the month", "potm"], "potm"],
+    [["community"], "community"],
+    [["birthday"], "birthday"],
+    [["halloween", "jack-o", "spooky"], "halloween"],
+    [["festive", "fut swap", "fut birthday"], "festive"],
+    [["rare"], "rare"],
+  ];
+
+  const getCardVisualClass = (rowData) => {
+    const rarityName = String(rowData?.rarity ?? "").toLowerCase();
+    if (rarityName) {
+      for (const [needles, slug] of RARITY_VISUAL_RULES) {
+        if (needles.some((needle) => rarityName.includes(needle))) {
+          return `ea-data-preview-card-image--${slug}`;
+        }
+      }
+    }
+    if (rowData?.isSpecial) return "ea-data-preview-card-image--special";
+    const label = String(rowData?.qualityLabel ?? "").toLowerCase();
+    if (label === "gold") return "ea-data-preview-card-image--gold";
+    if (label === "silver") return "ea-data-preview-card-image--silver";
+    if (label === "bronze") return "ea-data-preview-card-image--bronze";
+    return "";
+  };
+
+  // Used by the innerHTML-rendered preview rows (renderPreviewRowsMarkup),
+  // which can't attach real event listeners. Cycles through the remaining
+  // image candidates on load failure instead of leaving just the plain
+  // rarity-color background with no player photo.
+  if (typeof window !== "undefined" && !window.__eaCardImgFallback) {
+    window.__eaCardImgFallback = function (imgEl) {
+      if (!imgEl) return;
+      let list = [];
+      try {
+        list = JSON.parse(imgEl.getAttribute("data-candidates") || "[]");
+      } catch {
+        list = [];
+      }
+      const nextIndex = (parseInt(imgEl.getAttribute("data-idx"), 10) || 0) + 1;
+      if (nextIndex < list.length) {
+        imgEl.setAttribute("data-idx", String(nextIndex));
+        imgEl.src = list[nextIndex];
+        return;
+      }
+      const wrap = imgEl.parentElement;
+      imgEl.remove();
+      if (wrap) wrap.classList.remove("has-image", "is-loaded");
+    };
+  }
+
   const createPreviewPlayerImage = (rowData) => {
     const wrap = document.createElement("div");
     wrap.className = "ea-data-preview-card-image";
+    const visualClass = getCardVisualClass(rowData);
+    if (visualClass) wrap.classList.add(visualClass);
     const candidates = Array.isArray(rowData?.imageCandidates)
       ? rowData.imageCandidates.slice()
       : [];
@@ -1117,13 +1194,17 @@
             )}</div>
             <div class="ea-data-preview-card-image${
               row?.imageCandidates?.length ? " has-image" : ""
+            }${
+              getCardVisualClass(row) ? ` ${getCardVisualClass(row)}` : ""
             }">
               <span>${escapeHtml(row?.rating ?? "?")}</span>
               ${
                 row?.imageCandidates?.[0]
                   ? `<img src="${escapeHtml(row.imageCandidates[0])}" alt="${escapeHtml(
                       `${row?.name ?? "Player"} card`,
-                    )}" />`
+                    )}" data-idx="0" data-candidates="${escapeHtml(
+                      JSON.stringify(row.imageCandidates),
+                    )}" onload="this.parentElement.classList.add('is-loaded')" onerror="window.__eaCardImgFallback(this)" />`
                   : ""
               }
             </div>
@@ -1933,7 +2014,8 @@
       const name = sanitizeDisplayText(value?.name);
       const rating = normalizeRatingValue(value?.rating);
       const rarityName = sanitizeDisplayText(value?.rarityName);
-      excludedPlayerMetaCache.set(id, { name, rating, rarityName });
+      const assetId = readNumeric(value?.assetId);
+      excludedPlayerMetaCache.set(id, { name, rating, rarityName, assetId });
     }
   };
 
@@ -1952,6 +2034,7 @@
           name: sanitizeDisplayText(meta?.name) ?? null,
           rating: normalizeRatingValue(meta?.rating),
           rarityName: sanitizeDisplayText(meta?.rarityName) ?? null,
+          assetId: readNumeric(meta?.assetId) ?? null,
         };
       }
       window?.localStorage?.setItem?.(
@@ -1984,11 +2067,13 @@
       normalizeRatingValue(prev?.rating);
     const rarityName =
       sanitizeDisplayText(partial?.rarityName) ?? prev?.rarityName ?? null;
-    const next = { name, rating, rarityName };
+    const assetId = readNumeric(partial?.assetId) ?? prev?.assetId ?? null;
+    const next = { name, rating, rarityName, assetId };
     const changed =
       prev?.name !== next.name ||
       prev?.rating !== next.rating ||
-      prev?.rarityName !== next.rarityName;
+      prev?.rarityName !== next.rarityName ||
+      prev?.assetId !== next.assetId;
     if (changed) {
       excludedPlayerMetaCache.set(key, next);
       schedulePersistExcludedPlayerMetaCache();
@@ -2011,6 +2096,11 @@
           ) ?? null,
         rating: player?.rating ?? null,
         rarityName: resolveEntityRarityName(player),
+        assetId:
+          readNumeric(player?.assetId) ??
+          readNumeric(player?.resourceId) ??
+          readNumeric(player?.definitionId) ??
+          null,
       });
     }
   };
@@ -7930,6 +8020,18 @@
         removeBtn.textContent = "Remove";
         removeBtn.disabled = exclusionActionInFlight;
 
+        const cardImage = createPreviewPlayerImage({
+          name: meta?.name ?? `Player ${id}`,
+          rating: meta?.rating ?? "?",
+          rarity: meta?.rarityName ?? "",
+          qualityLabel: getPlayerQualityLabel({ rating: meta?.rating }),
+          imageCandidates: getPlayerImageCandidates(
+            meta?.assetId != null ? { assetId: meta.assetId } : null,
+          ),
+        });
+        cardImage.classList.add("ea-data-excluded-item-card");
+
+        row.append(cardImage);
         row.append(main);
         row.append(removeBtn);
         excludedListEl.append(row);
@@ -23354,6 +23456,36 @@
       quality: "gold",
       rarity: "rare",
     }),
+    Object.freeze({
+      key: "special_totw_inform",
+      label: "TOTW / Inform",
+      quality: "gold",
+      rarity: "special",
+    }),
+    Object.freeze({
+      key: "special_tots",
+      label: "TOTS",
+      quality: "gold",
+      rarity: "special",
+    }),
+    Object.freeze({
+      key: "special_icon",
+      label: "Icon",
+      quality: "gold",
+      rarity: "special",
+    }),
+    Object.freeze({
+      key: "special_hero",
+      label: "Hero",
+      quality: "gold",
+      rarity: "special",
+    }),
+    Object.freeze({
+      key: "special_other",
+      label: "Other Special",
+      quality: "gold",
+      rarity: "special",
+    }),
   ]);
   const CARD_BUCKET_KEYS = Object.freeze(CARD_BUCKETS.map((bucket) => bucket.key));
   const CARD_BUCKET_KEY_SET = new Set(CARD_BUCKET_KEYS);
@@ -25425,6 +25557,31 @@
     return `${isRareBasePlayer(player) ? "rare" : "common"}_${quality}`;
   };
 
+  // Classifies ANY player (base or special) into one of the CARD_BUCKETS keys,
+  // so the bucket picker + rating range apply to every card in the club,
+  // not just non-special ones.
+  const getCardBucket = (player) => {
+    if (!player) return null;
+    if (!Boolean(player?.isSpecial)) return getBaseCardBucket(player);
+    const rarityName = String(player?.rarityName ?? "").trim().toLowerCase();
+    if (rarityName.includes("icon")) return "special_icon";
+    if (rarityName.includes("hero")) return "special_hero";
+    if (
+      rarityName.includes("team of the season") ||
+      rarityName.includes("tots")
+    ) {
+      return "special_tots";
+    }
+    if (
+      rarityName.includes("team of the week") ||
+      rarityName.includes("totw") ||
+      rarityName.includes("inform")
+    ) {
+      return "special_totw_inform";
+    }
+    return "special_other";
+  };
+
   const filterPlayersBySolverPoolSettings = (
     players,
     settings,
@@ -25507,7 +25664,7 @@
       const isWithinRatingRange =
         rating != null && rating >= ratingMin && rating <= ratingMax;
       if (useUnassigned && (player?.isDuplicate || player?.isUnassigned)) {
-        const bucket = getBaseCardBucket(player);
+        const bucket = getCardBucket(player);
         return (
           isWithinRatingRange &&
           (!bucket || allowedCardBucketSet.has(bucket))
@@ -25517,7 +25674,7 @@
       if (excludeTradable && Boolean(player?.isTradeable)) return false;
       if (excludeSpecial && Boolean(player?.isSpecial) && !isTotwOrTots)
         return false;
-      const bucket = getBaseCardBucket(player);
+      const bucket = getCardBucket(player);
       if (bucket && !allowedCardBucketSet.has(bucket)) return false;
       return isWithinRatingRange;
     });
