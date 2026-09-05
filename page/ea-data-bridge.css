@@ -4604,6 +4604,26 @@ input.ea-data-range__input:disabled::-moz-range-progress {
   opacity: 0.45;
   cursor: default;
 }
+.ea-data-preview-remove {
+  flex: 0 0 auto;
+  order: 100;
+  border: 1px solid rgba(242, 69, 32, 0.6);
+  background: rgba(242, 69, 32, 0.1);
+  color: #ff9a84;
+  border-radius: 999px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  cursor: pointer;
+}
+.ea-data-preview-remove:hover:not(:disabled) {
+  background: rgba(242, 69, 32, 0.25);
+}
+.ea-data-preview-remove:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 .ea-data-pill {
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.04);

@@ -349,14 +349,7 @@ window.addEventListener(
   true,
 );
 
-const solverBridgeSeen = new Set();
-
-let solverWorkerInitPromise = null;
-const solverWorkerRequests = new Map();
-let solverPort = null;
 let extensionContextReloadScheduled = false;
-
-const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const isExtensionContextInvalidError = (error) => {
   const message = String(error?.message || error || "");
@@ -372,14 +365,193 @@ const scheduleExtensionContextReload = (error) => {
   if (!isExtensionContextInvalidError(error)) return false;
   if (extensionContextReloadScheduled) return true;
   extensionContextReloadScheduled = true;
-  try {
-    document.documentElement.dataset.eaDataContextRecovery = "reload-required";
-  } catch {}
-  console.warn(
-    "[EA Data] Extension context changed; refresh the EA Web App once manually.",
-  );
+  console.warn("[EA Data] Extension updated; reloading the EA Web App.");
+  window.setTimeout(() => window.location.reload(), 100);
   return true;
 };
+
+const initFodderFlowAuthUi = () => {
+  if (window !== window.top || document.getElementById("ff-auth-host")) return;
+  const host = document.createElement("div");
+  host.id = "ff-auth-host";
+  // This control is independent of EA's sign-in UI, so keep it visible on
+  // the EA login screen as well as once the Web App has loaded.
+  // This is a temporary position until EA renders the balance control. The
+  // button is then aligned immediately to the left of the coin total.
+  host.style.cssText = "position:fixed;top:16px;left:12px;z-index:2147483647";
+  const root = host.attachShadow({ mode: "closed" });
+  root.innerHTML = `
+    <style>
+      *{box-sizing:border-box;font-family:Arial,sans-serif}button,input{font:inherit}
+      .pill{border:0;background:#0d96e9;color:#fff;border-radius:3px;padding:9px 12px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:none;white-space:nowrap}
+      .pill.user{background:#202029;border-color:#f2ca50;color:#f2ca50;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .backdrop{display:none;position:fixed;inset:0;background:#0009;align-items:center;justify-content:center;padding:16px}.backdrop.open{display:flex}
+      .modal{width:min(414px,100%);background:#201f27;border:1px solid #45434e;border-radius:12px;color:#fff;padding:22px;box-shadow:0 24px 80px #000}
+      .head{display:flex;justify-content:space-between;align-items:center}.head h2{font-size:20px;margin:0}.x{border:0;background:transparent;color:#aaa;font-size:24px;cursor:pointer}
+      p{color:#bcb9c3;line-height:1.45;margin:20px 0}form{display:grid;gap:14px}input{width:100%;padding:14px 10px;color:#fff;background:#2b2933;border:1px solid #5b5864;border-radius:3px;outline:none}input:focus{border-color:#29bff1}
+      .name{display:none}.name.show{display:block}.error{min-height:18px;color:#ff6b6b;font-size:13px}.submit{padding:12px;border:1px solid #d7ad2c;border-radius:5px;background:#3b3323;color:#ffd758;font-weight:800;cursor:pointer}.submit:disabled{opacity:.55}
+      .mode,.logout{display:block;width:100%;margin-top:14px;border:0;background:transparent;color:#34c8d5;text-decoration:underline;cursor:pointer}.logout{color:#ff8080}.signed{display:none;text-align:center}.signed.show{display:block}.login.hidden{display:none}
+      @media(max-width:900px){:host{right:12px!important;top:62px!important}.pill{padding:7px 9px}}
+    </style>
+    <button class="pill" id="pill">Sign in to FodderFlow</button>
+    <div class="backdrop" id="backdrop">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="title">
+        <div class="head"><h2 id="title">Sign in to FodderFlow</h2><button class="x" id="close" aria-label="Close">×</button></div>
+        <div class="login" id="loginPane">
+          <p id="copy">Enter your email and password to sign in to your FodderFlow account.</p>
+          <form id="form">
+            <input class="name" id="name" maxlength="80" autocomplete="name" placeholder="Name">
+            <input id="email" type="email" autocomplete="email" placeholder="Email" required>
+            <input id="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" placeholder="Password" required>
+            <div class="error" id="error" role="alert"></div>
+            <button class="submit" id="submit" type="submit">Sign in</button>
+          </form>
+          <button class="mode" id="mode">Don't have an account? Sign up on FodderFlow</button>
+        </div>
+        <div class="signed" id="signedPane"><p id="signedText"></p><button class="logout" id="logout">Sign out</button></div>
+      </section>
+    </div>`;
+  document.documentElement.appendChild(host);
+
+  const positionBesideCoinBalance = () => {
+    try {
+      // EA's rendered coin value is the only comma-formatted numeric leaf in
+      // the top bar (for example "186,760"). Avoid matching parent wrappers.
+      const balance = Array.from(document.querySelectorAll("body *"))
+        .filter((node) => node !== host && node.children.length === 0)
+        .map((node) => ({
+          node,
+          text: String(node.textContent || "").trim(),
+          rect: node.getBoundingClientRect(),
+        }))
+        .find(
+          ({ text, rect }) =>
+            /^\d{1,3}(?:,\d{3})+$/.test(text) &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.top >= 0 &&
+            rect.top < 160,
+        );
+      if (!balance) return false;
+
+      const hostRect = host.getBoundingClientRect();
+      const buttonWidth = hostRect.width || 148;
+      const buttonHeight = hostRect.height || 36;
+      host.style.left = `${Math.max(8, balance.rect.left - buttonWidth - 8)}px`;
+      host.style.top = `${Math.max(8, balance.rect.top + (balance.rect.height - buttonHeight) / 2)}px`;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let balancePositionTimer = null;
+  const queueBalancePosition = () => {
+    if (balancePositionTimer != null) return;
+    balancePositionTimer = window.setTimeout(() => {
+      balancePositionTimer = null;
+      positionBesideCoinBalance();
+    }, 80);
+  };
+  requestAnimationFrame(() => {
+    positionBesideCoinBalance();
+    window.setTimeout(positionBesideCoinBalance, 500);
+    window.setTimeout(positionBesideCoinBalance, 1500);
+  });
+  new MutationObserver(queueBalancePosition).observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+  window.addEventListener("resize", queueBalancePosition);
+
+  // EA's own login screen contains email fields. Previously those fields hid
+  // FodderFlow's login control, which is exactly when users need it.
+  host.style.display = "block";
+
+  const $ = (id) => root.getElementById(id);
+  let authenticated = false;
+  let user = null;
+  const send = (message) => new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        const runtimeError = chrome.runtime?.lastError;
+        if (runtimeError && scheduleExtensionContextReload(runtimeError)) return;
+        resolve(response || { ok: false });
+      });
+    } catch (error) {
+      if (scheduleExtensionContextReload(error)) return;
+      resolve({ ok: false, error: { message: error?.message } });
+    }
+  });
+  const render = () => {
+    $("pill").textContent = authenticated ? (user?.name || user?.email || "FodderFlow account") : "Sign in to FodderFlow";
+    $("pill").classList.toggle("user", authenticated);
+    $("loginPane").classList.toggle("hidden", authenticated);
+    $("signedPane").classList.toggle("show", authenticated);
+    const expiry = user?.premiumExpiresAt ? new Date(user.premiumExpiresAt) : null;
+    const plan = user?.isAdmin ? "Administrator · unlimited access" : user?.premium && expiry
+      ? `Premium until ${expiry.toLocaleDateString()}`
+      : "Authenticated · local solver access";
+    $("signedText").textContent = authenticated ? `${user?.email || "FodderFlow user"}\n${plan}` : "";
+    document.dispatchEvent(new CustomEvent("FF_AUTH_STATE", { detail: { authenticated, user } }));
+  };
+  const open = () => $("backdrop").classList.add("open");
+  const close = () => $("backdrop").classList.remove("open");
+  $("pill").addEventListener("click", open);
+  $("close").addEventListener("click", close);
+  $("backdrop").addEventListener("click", (event) => { if (event.target === $("backdrop")) close(); });
+  $("mode").addEventListener("click", () => {
+    // Account creation belongs on the FodderFlow website, not over the EA UI.
+    try { chrome.runtime.sendMessage({ type: "FF_OPEN_SIGNUP" }); } catch {}
+    close();
+  });
+  $("form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    $("submit").disabled = true;
+    $("error").textContent = "";
+    const response = await send({
+      type: "FF_AUTH_LOGIN",
+      payload: { name: $("name").value, email: $("email").value, password: $("password").value },
+    });
+    $("submit").disabled = false;
+    if (!response?.ok) { $("error").textContent = response?.error?.message || "Unable to sign in."; return; }
+    authenticated = true; user = response.data?.user || null; $("password").value = ""; render(); close();
+  });
+  $("logout").addEventListener("click", async () => {
+    await send({ type: "FF_AUTH_LOGOUT" }); authenticated = false; user = null; render(); close();
+  });
+
+  document.addEventListener("click", (event) => {
+    if (authenticated) return;
+    const protectedControl = event.target?.closest?.(
+      'button[class*="ea-data-"], a[class*="ea-data-"], [id^="ea-data-"] button, [id^="ea-data-"] input, [id^="ea-data-"] select',
+    );
+    if (!protectedControl) return;
+    event.preventDefault(); event.stopImmediatePropagation(); open();
+  }, true);
+
+  send({ type: "FF_AUTH_STATUS", force: true }).then((response) => {
+    authenticated = Boolean(response?.ok && response?.data?.authenticated);
+    user = response?.data?.user || null;
+    render();
+  });
+};
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initFodderFlowAuthUi, { once: true });
+} else {
+  initFodderFlowAuthUi();
+}
+
+const solverBridgeSeen = new Set();
+
+let solverWorkerInitPromise = null;
+const solverWorkerRequests = new Map();
+let solverPort = null;
+let localSolverWorker = null;
+let localSolverDisabled = false;
+
+const delayMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const createRequestId = () => {
   if (crypto?.randomUUID) return crypto.randomUUID();
@@ -481,11 +653,62 @@ const ensureSolverPort = () => {
   return solverPort;
 };
 
+const callLocalSolverWorkerOnce = (type, payload, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    if (!localSolverWorker) {
+      reject(new Error("Local solver worker unavailable"));
+      return;
+    }
+    const requestId = createRequestId();
+    const timerId = setTimeout(() => {
+      solverWorkerRequests.delete(requestId);
+      reject(new Error("Local solver timeout"));
+    }, Math.max(1000, Number(timeoutMs) || 65000));
+    solverWorkerRequests.set(requestId, { resolve, reject, timerId });
+    try {
+      localSolverWorker.postMessage({ type, requestId, payload });
+    } catch (error) {
+      solverWorkerRequests.delete(requestId);
+      clearTimeout(timerId);
+      reject(error);
+    }
+  });
+
 const initSolverWorker = () => {
   if (solverWorkerInitPromise) return solverWorkerInitPromise;
-  // The background solver is stateless; INIT is purely a bridge readiness check.
-  // Avoid sending extra background messages that can race with MV3 service worker shutdown.
-  solverWorkerInitPromise = Promise.resolve({ ready: true, mode: "bridge" });
+  solverWorkerInitPromise = (async () => {
+    if (localSolverDisabled || typeof Worker === "undefined") {
+      return { ready: true, mode: "local-background-fallback" };
+    }
+    try {
+      localSolverWorker = new Worker(
+        chrome.runtime.getURL("solver/worker.js"),
+        { type: "module", name: "fodder-flow-local-sbc" },
+      );
+      localSolverWorker.addEventListener("message", (event) => {
+        const msg = event.data || {};
+        if (msg.type !== WORKER_RESPONSE || !msg.requestId) return;
+        const pending = solverWorkerRequests.get(msg.requestId);
+        if (!pending) return;
+        solverWorkerRequests.delete(msg.requestId);
+        clearTimeout(pending.timerId);
+        if (msg.ok) pending.resolve(msg.data);
+        else pending.reject(msg.error || new Error("Local solver failed"));
+      });
+      localSolverWorker.addEventListener("error", () => {
+        localSolverDisabled = true;
+        localSolverWorker = null;
+      });
+      return await callLocalSolverWorkerOnce("INIT", null, 10000);
+    } catch {
+      try {
+        localSolverWorker?.terminate?.();
+      } catch {}
+      localSolverWorker = null;
+      localSolverDisabled = true;
+      return { ready: true, mode: "local-background-fallback" };
+    }
+  })();
   return solverWorkerInitPromise;
 };
 
@@ -544,6 +767,44 @@ const callSolverWorker = async (
   timeoutMs,
   { retries = 1 } = {},
 ) => {
+  if (type === "SOLVE") {
+    const auth = await new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage({ type: "FF_AUTH_STATUS" }, (response) => {
+          const runtimeError = chrome.runtime?.lastError;
+          if (runtimeError) {
+            if (scheduleExtensionContextReload(runtimeError)) return;
+            reject(new Error(runtimeError.message));
+            return;
+          }
+          resolve(response);
+        });
+      } catch (error) {
+        if (scheduleExtensionContextReload(error)) return;
+        reject(error);
+      }
+    });
+    if (!auth?.ok || !auth?.data?.authenticated) {
+      const error = new Error("Sign in to FodderFlow to use the solver.");
+      error.code = "AUTH_REQUIRED";
+      throw error;
+    }
+  }
+  await initSolverWorker();
+  if (localSolverWorker && !localSolverDisabled) {
+    try {
+      return await callLocalSolverWorkerOnce(type, payload, timeoutMs);
+    } catch (error) {
+      try {
+        localSolverWorker?.terminate?.();
+      } catch {}
+      localSolverWorker = null;
+      localSolverDisabled = true;
+      console.warn("[EA Data] Local worker failed; using local background solver", {
+        message: error?.message || String(error),
+      });
+    }
+  }
   try {
     return await callSolverWorkerOnce(type, payload, timeoutMs);
   } catch (error) {

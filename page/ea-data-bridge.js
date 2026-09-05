@@ -549,7 +549,9 @@
   let playersFetchCacheRevision = 0;
   const APPLY_MODE_DEFAULT = "default";
   const APPLY_MODE_EXPERIMENTAL_HYBRID = "experimental-hybrid";
-  let solverApplyMode = APPLY_MODE_EXPERIMENTAL_HYBRID;
+  // The experimental path turns lookup misses into concept cards. Keep it
+  // opt-in so normal solves can never leave an unusable concept squad behind.
+  let solverApplyMode = APPLY_MODE_DEFAULT;
 
   const normalizeApplyMode = (value) => {
     const normalized = String(value ?? "")
@@ -3236,9 +3238,75 @@
 
   const addPlayerToLookup = (lookup, key, player) => {
     if (!player) return;
-    addLookupEntry(lookup, key, player);
-    addLookupEntry(lookup, player.id, player);
-    addLookupEntry(lookup, player.definitionId, player);
+    const seen = new Set();
+    const mask = readNumeric(window?.ItemIdMask?.DATABASE);
+    const addVariants = (value) => {
+      if (value == null) return;
+      const valueKey = String(value);
+      if (!valueKey || valueKey === "NaN" || seen.has(valueKey)) return;
+      seen.add(valueKey);
+      addLookupEntry(lookup, value, player);
+      try {
+        const bigint = BigInt(value);
+        addLookupEntry(lookup, bigint.toString(), player);
+        if (mask != null) {
+          addLookupEntry(lookup, (bigint & BigInt(mask)).toString(), player);
+        }
+      } catch {}
+    };
+    [
+      key,
+      player.id,
+      player.itemGuid,
+      player.definitionId,
+      player._definitionId,
+      player.resourceId,
+      player.databaseId,
+      player.baseId,
+      player._baseId,
+      player.itemId,
+      player.cardAssetId,
+    ].forEach(addVariants);
+  };
+
+  const getRepositoryPileItems = (pile) => {
+    if (!pile) return [];
+    const collection = pile?.items?._collection ?? pile?._collection ?? null;
+    if (Array.isArray(collection)) return collection;
+    if (collection && typeof collection === "object") {
+      return Object.values(collection);
+    }
+    try {
+      if (typeof pile.values === "function") return Array.from(pile.values());
+    } catch {}
+    return [];
+  };
+
+  const buildRepositoryLookupForSbc = ({ includeUnassigned = false } = {}) => {
+    const repo = services?.Item?.itemDao?.itemRepo ?? null;
+    if (!repo) return null;
+    const lookup = new Map();
+    const piles = [repo.club, repo.storage];
+    if (includeUnassigned) piles.push(repo.unassigned);
+    for (const pile of piles) {
+      for (const item of getRepositoryPileItems(pile)) {
+        if (!item || resolveItemConcept(item)) continue;
+        try {
+          if (item?.isEnrolledInAcademy?.() || item?.isLimitedUse?.()) continue;
+        } catch {}
+        addPlayerToLookup(lookup, item.id, item);
+      }
+    }
+    return lookup.size ? lookup : null;
+  };
+
+  const mergeLookupMaps = (...lookups) => {
+    const merged = new Map();
+    for (const lookup of lookups) {
+      if (!(lookup instanceof Map)) continue;
+      for (const [key, item] of lookup) merged.set(key, item);
+    }
+    return merged.size ? merged : null;
   };
 
   const getSquadLookupForSbc = async (key = "id", options = {}) => {
@@ -3390,8 +3458,16 @@
     return null;
   };
 
+  const resolveItemConcept = (item) => {
+    try {
+      if (typeof item?.isConcept === "function") return Boolean(item.isConcept());
+    } catch {}
+    return Boolean(item?.concept);
+  };
+
   const resolveSlotValid = (slot, item) => {
     if (!slot && !item) return false;
+    if (resolveItemConcept(item)) return false;
     if (typeof slot?.isValid === "function") {
       try {
         return slot.isValid();
@@ -3403,14 +3479,7 @@
       } catch {}
     }
     if (typeof slot?.valid === "boolean") return slot.valid;
-    const concept =
-      (() => {
-        try {
-          if (typeof item?.isConcept === "function") return item.isConcept();
-        } catch {}
-        return Boolean(item?.concept);
-      })();
-    return Boolean(item && item.id && item.id !== 0 && !concept);
+    return Boolean(item && item.id && item.id !== 0);
   };
 
   const resolveSlotBrick = (slot) => {
@@ -3521,7 +3590,8 @@
       const isValid = resolveSlotValid(slot, item);
       const isLocked = resolveSlotLocked(slot);
       const keep =
-        isBrick || isLocked === true || (preserveExistingValid && isValid);
+        !resolveItemConcept(item) &&
+        (isBrick || isLocked === true || (preserveExistingValid && isValid));
       if (keep) {
         list[index] = item ?? null;
         markUsed(item);
@@ -3744,6 +3814,7 @@
       lookupMs: 0,
       lookupCount: 0,
       lookupWarmCacheUsed: false,
+      lookupRepositoryUsed: false,
       lookupClubPages: 0,
       lookupStoragePages: 0,
       lookupRetryableAttempts: 0,
@@ -3813,13 +3884,47 @@
     const requestedIds = (ids || []).filter((id) => id != null);
     const warmLookup = readWarmApplyLookup(lookupKey, requestedIds);
     if (warmLookup) perf.lookupWarmCacheUsed = true;
+    const repositoryLookup = buildRepositoryLookupForSbc({
+      includeUnassigned: usesUnassignedLookup,
+    });
+    let targetedLookup = null;
+    if (
+      !warmLookup &&
+      !lookupHasAllIds(repositoryLookup, requestedIds)
+    ) {
+      try {
+        targetedLookup = await buildTargetedLookupForSolutionIds(
+          requestedIds,
+          playerById,
+          lookupKey,
+          {
+            ...createTargetedApplyLookupOptions(),
+            includeUnassigned: usesUnassignedLookup,
+            refreshUnassigned: usesUnassignedLookup,
+            excludeActiveSquad:
+              usesUnassignedLookup || usesActiveSquadLookup ? false : true,
+          },
+        );
+      } catch {}
+    }
+    const localLookup = mergeLookupMaps(targetedLookup, repositoryLookup);
+    const seedLookup =
+      warmLookup ??
+      (lookupHasAllIds(localLookup, requestedIds) ? localLookup : null);
+    perf.lookupRepositoryUsed = Boolean(
+      !warmLookup &&
+      repositoryLookup &&
+      lookupHasAllIds(seedLookup, requestedIds),
+    );
     const getCachedLookup = async (force = false) => {
       if (cachedLookup && !force) return cachedLookup;
       delete lookupTelemetry.club;
       delete lookupTelemetry.storage;
-      cachedLookup = await withPerf("lookupMs", "lookupCount", () =>
+      const fetchedLookup = await withPerf("lookupMs", "lookupCount", () =>
         getSquadLookupForSbc(lookupKey, lookupOpts),
       );
+      cachedLookup =
+        mergeLookupMaps(fetchedLookup, repositoryLookup) ?? fetchedLookup;
       const clubPages = Number(lookupTelemetry?.club?.pages ?? 0);
       const storagePages = Number(lookupTelemetry?.storage?.pages ?? 0);
       const clubRetryableAttempts = Number(
@@ -3917,7 +4022,7 @@
         }
       }
     } catch {}
-    const lookup = warmLookup ?? (await getCachedLookup());
+    const lookup = seedLookup ?? (await getCachedLookup());
     const ItemPile =
       services?.Item?.UTItemPileEnum ?? window?.UTItemPileEnum ?? {};
     const clubPile = ItemPile.CLUB ?? 7;
@@ -4321,7 +4426,7 @@
     });
     if (conceptItems.length) {
       const error = new Error(
-        `Cannot apply squad: ${conceptItems.length} player(s) missing from club/storage (concept cards).`,
+        `Cannot apply squad: ${conceptItems.length} player(s) are stale or unavailable in club/storage.`,
       );
       error.code = "EA_APPLY_IDS_MISSING";
       error.meta = {
@@ -4337,9 +4442,14 @@
       saveChallenge(challenge),
     );
     if (isSbcAutomationActive() && saveRes?.success !== true) {
-      throw new Error(
+      const error = new Error(
         `saveChallenge failed (status ${saveRes?.status ?? "?"}, error ${saveRes?.error ?? "?"})`,
       );
+      error.code =
+        Number(saveRes?.status) === 409 || Number(saveRes?.error) === 495
+          ? "EA_SAVE_CONFLICT"
+          : "EA_SAVE_FAILED";
+      throw error;
     }
 
     // Hydrate applied items from DAO load, then push them
@@ -4406,7 +4516,7 @@
       });
       if (retryConceptItems.length) {
         const error = new Error(
-          `Cannot apply squad: ${retryConceptItems.length} player(s) missing from club/storage (concept cards).`,
+          `Cannot apply squad: ${retryConceptItems.length} player(s) are stale or unavailable in club/storage.`,
         );
         error.code = "EA_APPLY_IDS_MISSING";
         error.meta = {
@@ -4423,9 +4533,15 @@
         saveChallenge(challenge),
       );
       if (isSbcAutomationActive() && saveRetryRes?.success !== true) {
-        throw new Error(
+        const error = new Error(
           `saveChallenge failed (status ${saveRetryRes?.status ?? "?"}, error ${saveRetryRes?.error ?? "?"})`,
         );
+        error.code =
+          Number(saveRetryRes?.status) === 409 ||
+          Number(saveRetryRes?.error) === 495
+            ? "EA_SAVE_CONFLICT"
+            : "EA_SAVE_FAILED";
+        throw error;
       }
       const retryLoaded = await withPerf("loadMs", "loadCount", () =>
         loadChallenge(challenge, true, {
@@ -4479,6 +4595,7 @@
       lookupMs: perf.lookupMs,
       lookupCount: perf.lookupCount,
       lookupWarmCacheUsed: Boolean(perf.lookupWarmCacheUsed),
+      lookupRepositoryUsed: Boolean(perf.lookupRepositoryUsed),
       lookupFetches: lookupFetchCount,
       lookupClubPages: perf.lookupClubPages,
       lookupStoragePages: perf.lookupStoragePages,
@@ -10636,10 +10753,7 @@
 
       const title = document.createElement("div");
       title.className = "ea-data-solution-title";
-      title.textContent =
-        sol?.strategy === "low_fodder"
-          ? "Low-Card Alternative"
-          : `Solution #${active + 1}`;
+      title.textContent = `Solution #${active + 1}`;
       headerLeft.append(title);
 
       const submitToggle = document.createElement("button");
@@ -10816,6 +10930,22 @@
         );
         right.append(swapBtn);
 
+        const removeBtn = document.createElement("button");
+        removeBtn.type = "button";
+        removeBtn.className = "ea-data-preview-remove";
+        removeBtn.setAttribute("data-action", "remove-player");
+        removeBtn.setAttribute("data-player-id", String(playerId ?? ""));
+        if (data.slotIndex != null) {
+          removeBtn.setAttribute("data-slot-index", String(data.slotIndex));
+        }
+        removeBtn.textContent = "Remove";
+        removeBtn.disabled = isBusy || playerId == null;
+        removeBtn.setAttribute(
+          "aria-label",
+          `Remove and exclude ${String(name)} from this multi solve`,
+        );
+        right.append(removeBtn);
+
         main.append(left);
         main.append(right);
 
@@ -10964,7 +11094,11 @@
       if (!isBusy) startBtn.disabled = enabledSolutions.length === 0;
     };
 
-    const swapSolutionPlayer = async ({ playerId, slotIndex } = {}) => {
+    const swapSolutionPlayer = async ({
+      playerId,
+      slotIndex,
+      persistExclusion = false,
+    } = {}) => {
       if (multiSolveOverlayState?.running || playerId == null) return;
       const context = multiSolveOverlayState?.solveContext ?? null;
       const solutions = multiSolveOverlayState?.solutions ?? [];
@@ -11082,6 +11216,17 @@
           specialCount,
           enabled: current?.enabled !== false,
         };
+        if (persistExclusion) {
+          context.filters = {
+            ...context.filters,
+            excludedPlayerIds: Array.from(
+              new Set([
+                ...(context?.filters?.excludedPlayerIds ?? []).map(String),
+                selectedId,
+              ]),
+            ),
+          };
+        }
         multiSolveOverlayState.solutions = solutions;
         renderSolutions();
         await fetchPricesForPreviewRows(
@@ -11097,8 +11242,10 @@
         setStatus(`Solution ${active + 1} updated.`);
         showToast({
           type: "success",
-          title: "Player Swapped",
-          message: "The replacement was validated by the solver.",
+          title: persistExclusion ? "Player Removed" : "Player Swapped",
+          message: persistExclusion
+            ? "The player was excluded and replaced with a validated player."
+            : "The replacement was validated by the solver.",
           timeoutMs: 3500,
         });
       } catch (error) {
@@ -11139,6 +11286,12 @@
         void swapSolutionPlayer({
           playerId: btn.getAttribute("data-player-id"),
           slotIndex: btn.getAttribute("data-slot-index"),
+        });
+      } else if (action === "remove-player") {
+        void swapSolutionPlayer({
+          playerId: btn.getAttribute("data-player-id"),
+          slotIndex: btn.getAttribute("data-slot-index"),
+          persistExclusion: true,
         });
       }
     });
@@ -11514,7 +11667,7 @@
         const payload = await window.eaData.getSolverPayload({
           ignoreLoaned: true,
           includeUnassigned,
-          excludeActiveSquad: false,
+          excludeActiveSquad: true,
           forcePlayersFetch: true,
           preferWarmSnapshot: false,
         });
@@ -11666,52 +11819,8 @@
             stats: result?.stats ?? null,
             specialCount,
             enabled: true,
-            strategy: "balanced",
+            strategy: "normal",
           });
-
-          if (i === 0 && !multiSolveOverlayState.abortRequested) {
-            setStatus("Building low-card alternative...");
-            const alternative = await solveWithConceptFallback({
-              payload,
-              players: filteredPlayers,
-              requirements: safeRequirements,
-              requirementsNormalized: safeRequirementsNormalized,
-              requiredPlayers: payload.requiredPlayers ?? null,
-              squadSlots: payload.squadSlots ?? [],
-              prioritize: payload.prioritize,
-              filters: loopFilters,
-              optimize: {
-                lowFodderFirst: true,
-                preserveHighCards: false,
-                ratingCapOffset: 12,
-              },
-              debug: debugEnabled,
-              playerById,
-              label: "multi-low-fodder",
-            });
-            const alternativeIds = alternative?.solutions?.[0] ?? [];
-            const balancedKey = solutionIds.map(String).sort().join(",");
-            const alternativeKey = alternativeIds.map(String).sort().join(",");
-            if (
-              alternativeIds.length &&
-              alternativeKey !== balancedKey &&
-              !alternative?.requiresConcepts &&
-              !alternative?.stats?.requiresConcepts
-            ) {
-              solutions.push({
-                solutionIds: alternativeIds,
-                slotSolution: alternative?.solutionSlots?.[0] ?? null,
-                stats: alternative?.stats ?? null,
-                specialCount: alternativeIds.reduce(
-                  (count, id) =>
-                    count + (playerById.get(String(id))?.isSpecial ? 1 : 0),
-                  0,
-                ),
-                enabled: false,
-                strategy: "low_fodder",
-              });
-            }
-          }
           multiSolveOverlayState.solutions = solutions;
           setProgress(i + 1, times);
           renderSolutions();
@@ -11796,6 +11905,7 @@
       setProgress(0, solutions.length);
       const shouldAbort = () => Boolean(multiSolveOverlayState?.abortRequested);
       let submitted = 0;
+      const submittedPlayerIds = new Set();
       let completedWithoutError = false;
       enterSbcAutomation();
       try {
@@ -11816,18 +11926,104 @@
 
           setProgress(i, solutions.length);
 
-          const sol = solutions[i];
+          let sol = solutions[i];
           setStatus(`(${i + 1}/${solutions.length}) Applying players...`);
-          await applySolutionWithSelectedMode(
-            challengeEntity,
-            sol.solutionIds,
-            {
-              lookupKey: "id",
-              slotSolution: sol.slotSolution ?? null,
-              playerById: multiSolveOverlayState?.playerById ?? null,
-              preserveExistingValid: false,
-            },
-          );
+          try {
+            await applySolutionWithSelectedMode(
+              challengeEntity,
+              sol.solutionIds,
+              {
+                lookupKey: "id",
+                slotSolution: sol.slotSolution ?? null,
+                playerById: multiSolveOverlayState?.playerById ?? null,
+                preserveExistingValid: false,
+              },
+            );
+          } catch (applyError) {
+            const applyErrorCode = String(applyError?.code ?? "");
+            if (
+              applyErrorCode !== "EA_APPLY_IDS_MISSING" &&
+              applyErrorCode !== "EA_SAVE_CONFLICT"
+            ) {
+              throw applyError;
+            }
+
+            setStatus(`(${i + 1}/${solutions.length}) Refreshing stale players...`);
+            clearPlayersSnapshotCache({
+              clearWarmLookup: true,
+              bumpRevision: true,
+            });
+            const solveContext = multiSolveOverlayState?.solveContext ?? {};
+            const freshPayload = await window.eaData.getSolverPayload({
+              ignoreLoaned: true,
+              includeUnassigned: Boolean(solveContext?.filters?.useUnassigned),
+              excludeActiveSquad: true,
+              forcePlayersFetch: true,
+              preferWarmSnapshot: false,
+            });
+            const { safeRequirements, safeRequirementsNormalized } =
+              buildSafeRequirements(freshPayload);
+            const { filteredPlayers, mergedFilters } =
+              await getFilteredPlayersForSolve(
+                freshPayload,
+                startedChallengeId,
+              );
+            const excludedPlayerIds = Array.from(
+              new Set([
+                ...(solveContext?.filters?.excludedPlayerIds ?? []).map(String),
+                ...submittedPlayerIds,
+                ...(applyErrorCode === "EA_SAVE_CONFLICT"
+                  ? (sol?.solutionIds ?? []).map(String)
+                  : []),
+              ]),
+            );
+            const freshPlayerById = new Map(
+              filteredPlayers
+                .map((player) => [
+                  player?.id == null ? null : String(player.id),
+                  player,
+                ])
+                .filter(([id]) => id != null),
+            );
+            const recovered = await solveWithConceptFallback({
+              payload: freshPayload,
+              players: filteredPlayers,
+              requirements: safeRequirements,
+              requirementsNormalized: safeRequirementsNormalized,
+              requiredPlayers: freshPayload?.requiredPlayers ?? null,
+              squadSlots: freshPayload?.squadSlots ?? [],
+              prioritize: freshPayload?.prioritize,
+              filters: { ...mergedFilters, excludedPlayerIds },
+              debug: debugEnabled,
+              playerById: freshPlayerById,
+              label: "multi-submit-recovery",
+            });
+            if (!recovered?.solutions?.length) {
+              throw new Error(
+                "The live owned-player pool no longer has a valid squad.",
+              );
+            }
+            sol = {
+              ...sol,
+              solutionIds: recovered.solutions[0],
+              slotSolution: recovered?.solutionSlots?.[0] ?? null,
+              stats: recovered?.stats ?? null,
+            };
+            solutions[i] = sol;
+            multiSolveOverlayState.solutions = solutions;
+            multiSolveOverlayState.playerById = freshPlayerById;
+            renderSolutions();
+            await applySolutionWithSelectedMode(
+              challengeEntity,
+              sol.solutionIds,
+              {
+                lookupKey: "id",
+                slotSolution: sol.slotSolution,
+                playerById: freshPlayerById,
+                preserveExistingValid: false,
+              },
+            );
+          }
           refreshOpenChallengeUI(challengeEntity);
 
           setStatus(`(${i + 1}/${solutions.length}) Submitting...`);
@@ -11847,6 +12043,9 @@
             );
           }
           submitted += 1;
+          for (const id of sol.solutionIds ?? []) {
+            if (id != null) submittedPlayerIds.add(String(id));
+          }
           setProgress(i + 1, solutions.length);
 
           showToast({
@@ -23111,67 +23310,14 @@
                 ratingTarget: result?.stats?.ratingTarget ?? null,
               };
             } catch {}
-            updateLoadingOverlay("Applying concept plan...");
-            let conceptApply = null;
-            try {
-              conceptApply = await applyConceptPlanToChallengeUi({
-                challenge: activeChallengeForApply,
-                solveResult: result,
-                sourcePayload: payload,
-                playerMap: singleSolvePlayerById,
-              });
-              try {
-                window.__eaDataSolver = window.__eaDataSolver || {};
-                window.__eaDataSolver.lastConceptApplyResult = {
-                  at: Date.now(),
-                  challengeId: activeChallengeForApply?.id ?? null,
-                  ...conceptApply,
-                };
-                window.__eaDataSolver.lastConceptApplyError = null;
-              } catch {}
-            } catch (conceptApplyError) {
-              const conceptApplyFailure = {
-                challengeId: activeChallengeForApply?.id ?? null,
-                error: String(conceptApplyError?.message ?? conceptApplyError),
-                stack: conceptApplyError?.stack ?? null,
-                itemSummary: conceptApplyError?.itemSummary ?? null,
-                conceptApplyError:
-                  conceptApplyError?.conceptApplyError ?? null,
-              };
-              try {
-                window.__eaDataSolver = window.__eaDataSolver || {};
-                window.__eaDataSolver.lastConceptApplyError = {
-                  at: Date.now(),
-                  ...conceptApplyFailure,
-                };
-              } catch {}
-              console.log(
-                "[EA Data] Concept plan auto-apply failed",
-                conceptApplyFailure,
-              );
-              try {
-                dismissToast(activeProgressToast);
-                activeProgressToast = null;
-              } catch {}
-              showToast({
-                type: "error",
-                title: "Concept Apply Failed",
-                message:
-                  "EA rejected the concept preview apply. Check console for details.",
-                timeoutMs: 12000,
-              });
-              return;
-            }
-            updateLoadingOverlay("Refreshing UI...");
-            refreshSbcPanelView(view, activeChallengeForApply, { mode: "safe" });
             try {
               dismissToast(activeProgressToast);
               activeProgressToast = null;
             } catch {}
             showToast({
               type: "info",
-              title: "Concept Plan Applied",
-              message: `Preview applied with ${conceptApply?.conceptCount || conceptCount} concept player(s). It cannot be submitted until those players are owned.`,
+              title: "Concept Plan Found",
+              message: `Found a plan needing ${conceptCount} unowned player(s). The SBC squad was not changed.`,
               timeoutMs: 12000,
             });
             return;
@@ -24046,15 +24192,6 @@
       idSuffix: "use-evolution-players",
       label: "Use Evolution Players",
       help: "Allow evolution cards in generated solutions. When off, evolution cards are blocked (including unassigned duplicates) except already locked required players.",
-      scopes: Object.freeze(["challenge", "global", "multi", "set"]),
-      legacyKeys: Object.freeze([]),
-    }),
-    Object.freeze({
-      key: "allowConceptPlayers",
-      path: SETTINGS_PATHS.SOLVER_ALLOW_CONCEPT_PLAYERS,
-      idSuffix: "allow-concept-players",
-      label: "Fallback on Concept Players (experimental)",
-      help: "Allow concept fallback after owned players fail. Concept squads can be preview-applied, but cannot be submitted until those players are owned.",
       scopes: Object.freeze(["challenge", "global", "multi", "set"]),
       legacyKeys: Object.freeze([]),
     }),
@@ -27725,6 +27862,13 @@
     timeoutMs = null,
     onStatus = null,
   }) => {
+    // Submit-ready solutions must be made only from cards that exist in the
+    // user's live club/storage repositories. Concept searches were slow and
+    // could never be applied safely, so all solve modes now enforce owned-only.
+    filters = {
+      ...(filters && typeof filters === "object" ? filters : {}),
+      allowConceptPlayers: false,
+    };
     const ratingPriority =
       filters?.ratingPriority === "high_to_low" ? "high_to_low" : "low_to_high";
     const effectiveOptimize = {
@@ -31795,7 +31939,7 @@
 
   const quickOrganizePackItems = async (
     packItems = null,
-    { silent = false, refresh = true } = {},
+    { silent = false, refresh = true, duplicateStorageMinRating = 0 } = {},
   ) => {
     const refreshed = await getUnassignedItems({ refresh: true });
     const items = refreshed.length
@@ -31826,11 +31970,17 @@
     const storageSpace = Math.max(0, 100 - storageCount);
     const storageEligible = duplicates.filter((item) => {
       const isPlayer = isPlayerItemEntity(item);
+      const rating = getPackItemRating(item);
       const untradeable =
         typeof item?.isTradeable === "function"
           ? !item.isTradeable()
           : Boolean(item?.untradeable) || item?.isTradeable === false;
-      return isPlayer && untradeable && !(Number(item?.loans) > 0);
+      return (
+        isPlayer &&
+        untradeable &&
+        !(Number(item?.loans) > 0) &&
+        rating >= duplicateStorageMinRating
+      );
     });
     const toStorage = storageEligible.slice(0, storageSpace);
     if (toStorage.length) {
@@ -32173,6 +32323,7 @@
     button: null,
     wrapper: null,
   };
+  let quickOpenSetupOverlay = null;
 
   const getPackItemName = (item) => {
     try {
@@ -32590,6 +32741,103 @@
         font-size: 12px;
         font-weight: 800;
       }
+      .fodder-flow-quick-open-setup-backdrop {
+        position: fixed;
+        z-index: 2147483645;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        padding: 14px;
+        background: rgba(0, 0, 0, .68);
+      }
+      .fodder-flow-quick-open-setup {
+        width: min(430px, calc(100vw - 28px));
+        max-height: min(760px, calc(100vh - 28px));
+        overflow-y: auto;
+        padding: 18px;
+        border: 1px solid rgba(255,255,255,.18);
+        border-radius: 14px;
+        color: #fff;
+        background: #171820;
+        box-shadow: 0 20px 70px rgba(0,0,0,.65);
+        font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif !important;
+      }
+      .fodder-flow-quick-open-setup * { box-sizing: border-box; font-family: inherit !important; }
+      .fodder-flow-quick-open-setup h2 { margin: 0; font-size: 20px; }
+      .fodder-flow-quick-open-setup__intro {
+        margin: 7px 0 14px;
+        color: rgba(255,255,255,.65);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      .fodder-flow-quick-open-setup__field { margin-top: 12px; }
+      .fodder-flow-quick-open-setup__label {
+        display: block;
+        margin-bottom: 6px;
+        color: rgba(255,255,255,.78);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: .25px;
+        text-transform: uppercase;
+      }
+      .fodder-flow-quick-open-setup select,
+      .fodder-flow-quick-open-setup input[type="number"] {
+        width: 100%;
+        min-height: 42px;
+        padding: 8px 10px;
+        border: 1px solid rgba(255,255,255,.18);
+        border-radius: 8px;
+        color: #fff;
+        background: #0d0e13;
+        font-size: 13px;
+      }
+      .fodder-flow-quick-open-setup input:disabled { opacity: .45; }
+      .fodder-flow-quick-open-setup__toggle {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 45px;
+        margin-top: 8px;
+        padding: 9px 11px;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 9px;
+        background: rgba(255,255,255,.045);
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .fodder-flow-quick-open-setup__toggle input { width: 18px; height: 18px; accent-color: #27baff; }
+      .fodder-flow-quick-open-setup__notice {
+        margin-top: 13px;
+        padding: 9px 10px;
+        border: 1px solid rgba(66,215,255,.25);
+        border-radius: 8px;
+        color: rgba(255,255,255,.68);
+        background: rgba(66,215,255,.07);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .fodder-flow-quick-open-setup__buttons {
+        display: grid;
+        grid-template-columns: 1fr 1.6fr;
+        gap: 8px;
+        margin-top: 15px;
+      }
+      .fodder-flow-quick-open-setup__button {
+        min-height: 42px;
+        border: 1px solid rgba(255,255,255,.2);
+        border-radius: 8px;
+        cursor: pointer;
+        color: #fff;
+        background: rgba(255,255,255,.06);
+        font-size: 13px;
+        font-weight: 800;
+      }
+      .fodder-flow-quick-open-setup__button--start {
+        border: 0;
+        color: #071017;
+        background: linear-gradient(90deg, #32c8ed, #6f63df);
+      }
     `;
     document.head.appendChild(style);
   };
@@ -32958,7 +33206,204 @@
     return [];
   };
 
-  const openAllMyPacks = async (view) => {
+  const hideQuickOpenSetup = () => {
+    try {
+      quickOpenSetupOverlay?.remove();
+    } catch {}
+    quickOpenSetupOverlay = null;
+  };
+
+  const showQuickOpenSetup = async (view) => {
+    if (openAllPacksState.running) return;
+    ensureOpenAllPacksStyles();
+    hideQuickOpenSetup();
+    const packs = await getMyPackEntities(view);
+    if (!packs.length) {
+      showToast({
+        type: "info",
+        title: "Quick Open Packs",
+        message: "No packs are available in My Packs.",
+      });
+      return;
+    }
+
+    const groups = groupMyPackEntities(packs);
+    const backdrop = document.createElement("div");
+    backdrop.className = "fodder-flow-quick-open-setup-backdrop";
+    const panel = document.createElement("div");
+    panel.className = "fodder-flow-quick-open-setup";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-label", "Quick Open Packs settings");
+
+    const title = document.createElement("h2");
+    title.textContent = "Quick Open Packs";
+    const intro = document.createElement("p");
+    intro.className = "fodder-flow-quick-open-setup__intro";
+    intro.textContent =
+      "Choose exactly which packs to open and how duplicate items should be handled.";
+    panel.append(title, intro);
+
+    const addField = (labelText, control) => {
+      const field = document.createElement("div");
+      field.className = "fodder-flow-quick-open-setup__field";
+      const label = document.createElement("label");
+      label.className = "fodder-flow-quick-open-setup__label";
+      label.textContent = labelText;
+      label.appendChild(control);
+      field.appendChild(label);
+      panel.appendChild(field);
+      return field;
+    };
+    const addToggle = (text, checked = false) => {
+      const label = document.createElement("label");
+      label.className = "fodder-flow-quick-open-setup__toggle";
+      const caption = document.createElement("span");
+      caption.textContent = text;
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = checked;
+      label.append(caption, input);
+      panel.appendChild(label);
+      return input;
+    };
+
+    const packType = document.createElement("select");
+    const allOption = document.createElement("option");
+    allOption.value = "all";
+    allOption.textContent = `All pack types (${packs.length})`;
+    packType.appendChild(allOption);
+    groups.forEach((group, index) => {
+      const option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = `${group.name} (${group.count})`;
+      packType.appendChild(option);
+    });
+    addField("Pack type", packType);
+
+    const openEveryPack = addToggle("Open every available pack", true);
+    const quantity = document.createElement("input");
+    quantity.type = "number";
+    quantity.min = "1";
+    quantity.step = "1";
+    quantity.value = String(packs.length);
+    quantity.disabled = true;
+    addField("Number of packs", quantity);
+
+    const autoOrganize = addToggle("Auto-assign after every pack", true);
+    const storageMinRating = document.createElement("input");
+    storageMinRating.type = "number";
+    storageMinRating.min = "0";
+    storageMinRating.max = "99";
+    storageMinRating.step = "1";
+    storageMinRating.value = "75";
+    addField("Duplicate rating for SBC Storage", storageMinRating);
+
+    const pauseOnSpecial = addToggle("Stop after pulling a special player", false);
+    const specialMinRating = document.createElement("input");
+    specialMinRating.type = "number";
+    specialMinRating.min = "0";
+    specialMinRating.max = "99";
+    specialMinRating.step = "1";
+    specialMinRating.value = "85";
+    specialMinRating.disabled = true;
+    addField("Special-player minimum rating", specialMinRating);
+
+    const speed = document.createElement("select");
+    for (const [label, value] of [
+      ["Balanced — 0.9 seconds", "900"],
+      ["Fast — 0.5 seconds", "500"],
+      ["Careful — 1.5 seconds", "1500"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      speed.appendChild(option);
+    }
+    addField("Delay between packs", speed);
+
+    const availableCount = () =>
+      packType.value === "all"
+        ? packs.length
+        : groups[Number(packType.value)]?.count ?? 0;
+    const syncQuantity = () => {
+      const available = Math.max(1, availableCount());
+      quantity.max = String(available);
+      if (openEveryPack.checked) quantity.value = String(available);
+      else quantity.value = String(Math.min(available, Math.max(1, Number(quantity.value) || 1)));
+      quantity.disabled = openEveryPack.checked;
+    };
+    packType.addEventListener("change", syncQuantity);
+    openEveryPack.addEventListener("change", syncQuantity);
+    pauseOnSpecial.addEventListener("change", () => {
+      specialMinRating.disabled = !pauseOnSpecial.checked;
+    });
+
+    const notice = document.createElement("div");
+    notice.className = "fodder-flow-quick-open-setup__notice";
+    notice.textContent =
+      "Auto-assign sends non-duplicates to your Club and eligible untradeable duplicate players at or above the selected rating to SBC Storage. Opening stops if anything still needs attention. Quick Sell is never automatic.";
+    panel.appendChild(notice);
+
+    const buttons = document.createElement("div");
+    buttons.className = "fodder-flow-quick-open-setup__buttons";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "fodder-flow-quick-open-setup__button";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", hideQuickOpenSetup);
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className =
+      "fodder-flow-quick-open-setup__button fodder-flow-quick-open-setup__button--start";
+    start.textContent = "Start Quick Open";
+    start.addEventListener("click", () => {
+      const groupIndex = packType.value === "all" ? null : Number(packType.value);
+      const available = availableCount();
+      const requested = openEveryPack.checked
+        ? available
+        : Math.min(available, Math.max(1, Number(quantity.value) || 1));
+      const options = {
+        groupName: groupIndex == null ? null : groups[groupIndex]?.name ?? null,
+        quantity: requested,
+        autoOrganize: autoOrganize.checked,
+        duplicateStorageMinRating: Math.min(
+          99,
+          Math.max(0, Number(storageMinRating.value) || 0),
+        ),
+        stopOnSpecial: pauseOnSpecial.checked,
+        specialMinRating: Math.min(
+          99,
+          Math.max(0, Number(specialMinRating.value) || 0),
+        ),
+        delayMs: Math.max(0, Number(speed.value) || 900),
+      };
+      hideQuickOpenSetup();
+      void openAllMyPacks(view, options);
+    });
+    buttons.append(cancel, start);
+    panel.appendChild(buttons);
+    backdrop.appendChild(panel);
+    backdrop.addEventListener("click", (event) => {
+      if (event.target === backdrop) hideQuickOpenSetup();
+    });
+    document.body.appendChild(backdrop);
+    quickOpenSetupOverlay = backdrop;
+    syncQuantity();
+  };
+
+  const openAllMyPacks = async (
+    view,
+    {
+      groupName = null,
+      quantity = Number.POSITIVE_INFINITY,
+      autoOrganize = true,
+      duplicateStorageMinRating = 75,
+      stopOnSpecial = false,
+      specialMinRating = 85,
+      delayMs: packDelayMs = 900,
+    } = {},
+  ) => {
     if (openAllPacksState.running) return;
     openAllPacksState.running = true;
     openAllPacksState.stopRequested = false;
@@ -32969,17 +33414,27 @@
 
     const button = openAllPacksState.button;
     if (button) {
-      button.disabled = true;
-      button.textContent = "Opening Packs…";
+      button.disabled = false;
+      button.textContent = "Stop after this pack";
     }
 
     try {
-      const packs = await getMyPackEntities(view);
+      const allPacks = await getMyPackEntities(view);
+      const normalizedGroupName = String(groupName ?? "").trim().toLowerCase();
+      const matchingPacks = normalizedGroupName
+        ? allPacks.filter(
+            (pack) => getReadablePackName(pack).trim().toLowerCase() === normalizedGroupName,
+          )
+        : allPacks;
+      const requestedCount = Number.isFinite(quantity)
+        ? Math.max(1, Math.floor(quantity))
+        : matchingPacks.length;
+      const packs = matchingPacks.slice(0, requestedCount);
       openAllPacksState.total = packs.length;
       if (!packs.length) {
         showToast({
           type: "info",
-          title: "Open All Packs",
+          title: "Quick Open Packs",
           message: "No My Packs were found.",
         });
         return;
@@ -32993,7 +33448,7 @@
       ) {
         showToast({
           type: "error",
-          title: "Open All Packs",
+          title: "Quick Open Packs",
           message: "Clear the existing unassigned items first.",
         });
         return;
@@ -33006,7 +33461,7 @@
         if (!pack || typeof pack.open !== "function") {
           showToast({
             type: "error",
-            title: "Open All Packs",
+            title: "Quick Open Packs",
             message: `${packName}: EA pack open method unavailable.`,
           });
           break;
@@ -33020,18 +33475,35 @@
           openAllPacksState.lastResults.push(result);
           openAllPacksState.opened += 1;
           if (button) {
-            button.textContent = `Quick Opening ${openAllPacksState.opened}/${openAllPacksState.total}…`;
+            button.textContent = `Quick Opening ${openAllPacksState.opened}/${openAllPacksState.total} · Stop`;
           }
-          const organizeResult = await quickOrganizePackItems(result.rawItems, {
-            silent: true,
-            refresh: false,
-          });
-          organized.moved += organizeResult.moved;
-          organized.stored += organizeResult.stored;
-          organized.unresolved += organizeResult.unresolved;
-          if (organizeResult.unresolved > 0) {
-            stopReason = `${organizeResult.unresolved} duplicate item(s) need attention before more packs can be opened.`;
+          if (autoOrganize) {
+            const organizeResult = await quickOrganizePackItems(result.rawItems, {
+              silent: true,
+              refresh: false,
+              duplicateStorageMinRating,
+            });
+            organized.moved += organizeResult.moved;
+            organized.stored += organizeResult.stored;
+            organized.unresolved += organizeResult.unresolved;
+            if (organizeResult.unresolved > 0) {
+              stopReason = `${organizeResult.unresolved} item(s) need attention before more packs can be opened.`;
+              break;
+            }
+          } else {
+            organized.unresolved += result.rawItems.length;
+            stopReason = "Auto-assign is off. Review this pack before opening another.";
             break;
+          }
+          const specialPull = result.items.find(
+            (item) => item.isSpecial && item.rating >= specialMinRating,
+          );
+          if (stopOnSpecial && specialPull) {
+            stopReason = `Stopped on ${specialPull.rating || "special"} ${specialPull.name}.`;
+            break;
+          }
+          if (openAllPacksState.opened < openAllPacksState.total && packDelayMs > 0) {
+            await delayMs(packDelayMs);
           }
         } catch (error) {
           packQuickOpenState.fastPackOpen = false;
@@ -33050,7 +33522,10 @@
       openAllPacksState.running = false;
       if (button) {
         button.disabled = false;
-        button.textContent = `Open All Packs (${openAllPacksState.total})`;
+        const available = Array.isArray(view?.__fodderFlowMyPackEntities)
+          ? view.__fodderFlowMyPackEntities.length
+          : openAllPacksState.total;
+        button.textContent = `Quick Open Packs (${available})`;
       }
       if (openAllPacksState.opened) {
         try {
@@ -33173,8 +33648,16 @@
             const button = document.createElement("button");
             button.type = "button";
             button.className = "fodder-flow-open-all-packs";
-            button.textContent = `Open All Packs (${packs.length})`;
-            button.addEventListener("click", () => openAllMyPacks(this));
+            button.textContent = `Quick Open Packs (${packs.length})`;
+            button.addEventListener("click", () => {
+              if (openAllPacksState.running) {
+                openAllPacksState.stopRequested = true;
+                button.disabled = true;
+                button.textContent = "Stopping…";
+                return;
+              }
+              void showQuickOpenSetup(this);
+            });
             wrapper.appendChild(button);
             this.__itemList.prepend(wrapper);
             this.__fodderFlowOpenAllPacksWrapper = wrapper;

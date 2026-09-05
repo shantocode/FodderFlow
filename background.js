@@ -7,6 +7,144 @@ const FUTGG_PLAYERS_BRIDGE_REQUEST = "EA_DATA_FUTGG_PLAYERS_REQUEST";
 const ALLOWED_BRIDGE_INJECT_PATHS = new Set(["page/ea-data-bridge.js"]);
 const FUT_PRICE_API_URL = "https://www.fut.gg/api/fut/player-prices/26/";
 const FUT_PLAYERS_API_URL = "https://www.fut.gg/api/fut/players/v2/26/";
+// Try the Vercel origin first, then the custom domain. Some ad blockers block
+// the former; both deployments must use the same authentication database.
+const AUTH_API_BASES = [
+  "https://fodderflowggfc.vercel.app/api/auth",
+  "https://fodderflow.shant0.xyz/api/auth",
+];
+const AUTH_STORAGE_KEY = "fodderflowAuth";
+const AUTH_CACHE_MS = 5 * 60 * 1000;
+let authCache = { checkedAt: 0, authenticated: false, user: null };
+
+const fetchAuth = async (path, options = {}) => {
+  let lastError = null;
+  for (let index = 0; index < AUTH_API_BASES.length; index += 1) {
+    try {
+      const response = await fetch(`${AUTH_API_BASES[index]}${path}`, options);
+      // A server outage can use the backup too. Do not retry normal 4xx
+      // responses: an invalid password should remain an invalid password.
+      if (response.status >= 500 && index < AUTH_API_BASES.length - 1) {
+        lastError = new Error(`Authentication service returned ${response.status}`);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (index === AUTH_API_BASES.length - 1) throw error;
+    }
+  }
+  throw lastError || new Error("Authentication service is unavailable");
+};
+
+const fetchApi = async (path, options = {}) => {
+  let lastError = null;
+  for (let index = 0; index < AUTH_API_BASES.length; index += 1) {
+    try {
+      const apiBase = AUTH_API_BASES[index].replace(/\/auth$/, "");
+      const response = await fetch(`${apiBase}/${path.replace(/^\/+/, "")}`, options);
+      if (response.status >= 500 && index < AUTH_API_BASES.length - 1) {
+        lastError = new Error(`Service returned ${response.status}`);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (index === AUTH_API_BASES.length - 1) throw error;
+    }
+  }
+  throw lastError || new Error("Service unavailable");
+};
+
+const readStoredAuth = async () =>
+  (await chrome.storage.local.get(AUTH_STORAGE_KEY))?.[AUTH_STORAGE_KEY] ?? null;
+
+const verifyAuth = async ({ force = false } = {}) => {
+  if (!force && Date.now() - authCache.checkedAt < AUTH_CACHE_MS) return authCache;
+  const stored = await readStoredAuth();
+  if (!stored?.token) {
+    authCache = { checkedAt: Date.now(), authenticated: false, user: null };
+    return authCache;
+  }
+  try {
+    const response = await fetchAuth("/session", {
+      headers: { Authorization: `Bearer ${stored.token}` },
+      cache: "no-store",
+    });
+    if (!response.ok) throw new Error("Session expired");
+    const data = await response.json();
+    authCache = { checkedAt: Date.now(), authenticated: true, user: data.user };
+  } catch {
+    await chrome.storage.local.remove(AUTH_STORAGE_KEY);
+    authCache = { checkedAt: Date.now(), authenticated: false, user: null };
+  }
+  return authCache;
+};
+
+const consumeSolverAllowance = async () => {
+  const stored = await readStoredAuth();
+  if (!stored?.token) throw new Error("Sign in to FodderFlow to use the solver.");
+  const response = await fetchApi("solver/consume", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${stored.token}` },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.allowed) {
+    const error = new Error(data.error || "Unable to verify solver allowance.");
+    error.code = response.status === 429 ? "DAILY_LIMIT_REACHED" : "ALLOWANCE_FAILED";
+    throw error;
+  }
+  if (data.user) {
+    authCache = { checkedAt: Date.now(), authenticated: true, user: data.user };
+    await chrome.storage.local.set({ [AUTH_STORAGE_KEY]: { token: stored.token, user: data.user } });
+  }
+  return data;
+};
+
+const handleAuthMessage = async (message, sendResponse) => {
+  try {
+    if (message.type === "FF_AUTH_STATUS") {
+      sendResponse({ ok: true, data: await verifyAuth({ force: message.force === true }) });
+      return;
+    }
+    if (message.type === "FF_AUTH_LOGOUT") {
+      const stored = await readStoredAuth();
+      if (stored?.token) {
+        await fetchAuth("/logout", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${stored.token}` },
+        }).catch(() => {});
+      }
+      await chrome.storage.local.remove(AUTH_STORAGE_KEY);
+      authCache = { checkedAt: Date.now(), authenticated: false, user: null };
+      sendResponse({ ok: true, data: authCache });
+      return;
+    }
+    const mode = message.type === "FF_AUTH_SIGNUP" ? "signup" : "login";
+    const response = await fetchAuth(`/${mode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message.payload || {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.token) throw new Error(data.error || "Authentication failed");
+    await chrome.storage.local.set({
+      [AUTH_STORAGE_KEY]: { token: data.token, user: data.user },
+    });
+    authCache = { checkedAt: Date.now(), authenticated: true, user: data.user };
+    sendResponse({ ok: true, data: authCache });
+  } catch (error) {
+    const networkBlocked = error instanceof TypeError && /fetch|network/i.test(String(error?.message));
+    sendResponse({
+      ok: false,
+      error: {
+        message: networkBlocked
+          ? "Can't reach the sign-in service. Allow fodderflowggfc.vercel.app in your ad blocker, then try again."
+          : error?.message || "Authentication failed",
+      },
+    });
+  }
+};
 const FUT_PRICE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FUT_PRICE_BATCH_SIZE = 10;
 const FUT_PRICE_MIN_GAP_MS = 450;
@@ -28,10 +166,7 @@ const FUT_PLAYERS_ALLOWED_FILTERS = new Set([
   "price__lte",
   "rarity_id",
 ]);
-import {
-  buildSolverContext,
-  solveSquad,
-} from "./solver/solver.js?v=2026-02-22d";
+import { solveLocalSbc } from "./solver/local-ai.js?v=2026-09-05a";
 import {
   initUpdateChecker,
   handleUpdateStatusMessage,
@@ -66,13 +201,30 @@ const handleSolverRequest = async (message, sendResponse) => {
   const workerType = payload?.type ?? "SOLVE";
   const workerPayload = payload?.payload ?? payload ?? null;
   try {
+    if (workerType === "SOLVE" && !(await verifyAuth()).authenticated) {
+      sendResponse({
+        ok: false,
+        error: {
+          code: "AUTH_REQUIRED",
+          message: "Sign in to FodderFlow to use the solver.",
+        },
+      });
+      return;
+    }
     if (workerType === "INIT") {
-      sendResponse({ ok: true, data: { ready: true, mode: "direct" } });
+      sendResponse({
+        ok: true,
+        data: {
+          ready: true,
+          mode: "local-background",
+          engine: "heuristic+glpk",
+          apiFree: true,
+        },
+      });
       return;
     }
     if (workerType === "SOLVE") {
-      const context = buildSolverContext(workerPayload || {});
-      const result = solveSquad(context);
+      const result = await solveLocalSbc(workerPayload || {});
       sendResponse({ ok: true, data: result });
       return;
     }
@@ -493,6 +645,14 @@ const handleFutPlayersRequest = (message, sendResponse) => {
 };
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "FF_OPEN_SIGNUP") {
+    chrome.tabs.create({ url: "https://fodderflow.shant0.xyz/?auth=signup" });
+    return false;
+  }
+  if (["FF_AUTH_STATUS", "FF_AUTH_LOGIN", "FF_AUTH_SIGNUP", "FF_AUTH_LOGOUT"].includes(message?.type)) {
+    handleAuthMessage(message, sendResponse);
+    return true;
+  }
   if (
     message?.type === "FF_GET_UPDATE_STATUS" ||
     message?.type === "FF_FORCE_UPDATE_CHECK"

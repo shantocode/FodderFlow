@@ -1,4 +1,4 @@
-import { buildSolverContext, solveSquad } from "./solver.js";
+import { solveLocalSbc } from "./local-ai.js";
 
 const WORKER_RESPONSE = "SOLVER_WORKER_RESPONSE";
 
@@ -11,13 +11,17 @@ self.addEventListener("message", async (event) => {
   if (!type || !requestId) return;
 
   if (type === "INIT") {
-    return reply(requestId, true, { ready: true, mode: "content-worker" });
+    return reply(requestId, true, {
+      ready: true,
+      mode: "local-worker",
+      engine: "heuristic+glpk",
+      apiFree: true,
+    });
   }
 
   if (type === "SOLVE") {
     try {
-      const context = buildSolverContext(payload || {});
-      const result = solveSquad(context);
+      const result = await solveLocalSbc(payload || {});
       return reply(requestId, true, result);
     } catch (error) {
       return reply(requestId, false, null, {

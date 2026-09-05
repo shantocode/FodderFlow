@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fodder Flow",
-  "version": "1.1.10",
+  "version": "1.5.2",
   "description": "Automation tool for SBC solving in the FC26 Web App",
   "icons": {
     "16": "icons/icon16.png",
@@ -18,8 +18,14 @@
     }
   },
   "permissions": ["storage", "scripting", "alarms", "tabs"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "host_permissions": [
+    "https://www.ea.com/*",
     "https://www.fut.gg/*",
+    "https://fodderflowggfc.vercel.app/*",
+    "https://fodderflow.shant0.xyz/*",
     "https://raw.githubusercontent.com/*"
   ],
   "background": {
@@ -49,6 +55,7 @@
         "solver/chemistry.js",
         "solver/constraint-compiler.js",
         "solver/worker.js",
+        "solver/local-ai.js",
         "solver/glpk.js",
         "solver/glpk.wasm"
       ],
