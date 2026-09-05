@@ -4345,6 +4345,18 @@ input.ea-data-range__input:disabled::-moz-range-progress {
   color: rgba(255, 255, 255, 0.78);
   letter-spacing: 0.2px;
 }
+.ea-data-toggle-row--always-on {
+  cursor: default;
+  border-color: rgba(11, 150, 255, 0.32);
+  background: rgba(11, 150, 255, 0.08);
+}
+.ea-data-toggle-row--always-on:hover {
+  border-color: rgba(11, 150, 255, 0.32);
+  background: rgba(11, 150, 255, 0.08);
+}
+.ea-data-toggle-row--always-on .ea-data-toggle-slider {
+  cursor: default;
+}
 .ea-data-preview-card-image {
   position: relative;
   width: 42px;

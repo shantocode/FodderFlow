@@ -2351,7 +2351,7 @@
     return criteria;
   };
 
-  const ACTIVE_SQUAD_TTL_MS = 60 * 1000;
+  const ACTIVE_SQUAD_TTL_MS = 5 * 1000;
   let activeSquadDefIdsCache = null; // { at: number, defIds: number[] }
   let activeSquadDefIdsInFlight = null;
 
@@ -2785,11 +2785,11 @@
   const normalizePlayersFetchOptions = (options = {}) => ({
     ignoreLoaned: options?.ignoreLoaned !== false,
     onlyFemales: options?.onlyFemales === true,
-    excludeActiveSquad: options?.excludeActiveSquad !== false,
+    // Permanent safety rule: protect the complete active squad roster,
+    // including the starting XI, substitutes, and reserves.
+    excludeActiveSquad: true,
     includeUnassigned: options?.includeUnassigned === true,
-    allowedActiveSquadDefIds: normalizeDefinitionIdKeyList(
-      options?.allowedActiveSquadDefIds,
-    ),
+    allowedActiveSquadDefIds: [],
     onlyUntradables: options?.onlyUntradables === true,
     onlyTradables: options?.onlyTradables === true,
     playerId: options?.playerId ?? null,
@@ -24253,8 +24253,22 @@
 
   const renderSolverToggleFields = ({ scope = null, idPrefix = "" } = {}) => {
     const defs = getSolverToggleFieldDefsForScope(scope);
-    if (!defs.length) return "";
-    return defs
+    const protectedRosterToggle = `
+      <label class="ea-data-toggle-row ea-data-toggle-row--always-on">
+        <span class="ea-data-toggle-text">
+          <span class="ea-data-toggle-title">Protect Squad &amp; Bench</span>
+          <span class="ea-data-toggle-icon-wrap" aria-label="Help">
+            <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.5" fill="none" class="ea-data-toggle-info-icon" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>
+            <div class="ea-data-toggle-tooltip">Always protects your starting XI, substitutes, and reserves from every SBC solver.</div>
+          </span>
+        </span>
+        <div class="ea-data-toggle-switch">
+          <input type="checkbox" checked disabled aria-label="Protect Squad and Bench always enabled" />
+          <div class="ea-data-toggle-slider"></div>
+        </div>
+      </label>
+    `;
+    return protectedRosterToggle + defs
       .map((field) => {
         const id = `${idPrefix}${field.idSuffix}`;
         return `
@@ -33880,14 +33894,10 @@
       };
     },
     getSolverPayload: async (options = {}, setIds = []) => {
-      const currentChallengeDefIds = currentChallenge
-        ? Array.from(getChallengeSquadDefinitionIds(currentChallenge))
-        : [];
       const solverOptions = {
         ...options,
-        excludeActiveSquad: options?.excludeActiveSquad ?? true,
-        allowedActiveSquadDefIds:
-          options?.allowedActiveSquadDefIds ?? currentChallengeDefIds,
+        excludeActiveSquad: true,
+        allowedActiveSquadDefIds: [],
       };
       const preferWarmSnapshot = options?.preferWarmSnapshot === true;
       const forcePlayersFetch =
